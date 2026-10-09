@@ -50,6 +50,10 @@ pub fn run(cli: Cli) -> Result<()> {
     }
     let mut conn = db::open(&db_path)?;
     db::migrate(&mut conn)?;
+    if let Command::View = cli.command {
+        with_ctx(&mut conn, &cli, |ctx| ctx.human())?;
+        return crate::view::run(&conn);
+    }
     let wait = matches!(cli.command, Command::Read { wait: true, .. });
     loop {
         let out = with_ctx(&mut conn, &cli, |ctx| dispatch(ctx, &cli.command))?;
@@ -80,7 +84,7 @@ fn with_ctx<T>(conn: &mut Connection, cli: &Cli, f: impl FnOnce(&Ctx) -> Result<
 
 fn dispatch(ctx: &Ctx, command: &Command) -> Result<String> {
     match command {
-        Command::Init { .. } | Command::Hook { .. } => unreachable!(),
+        Command::Init { .. } | Command::Hook { .. } | Command::View => unreachable!(),
         Command::Human {
             command: HumanCommand::Add { name },
         } => human_add(ctx, name),

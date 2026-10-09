@@ -602,3 +602,124 @@ pub fn session_agent(
         )
         .optional()?)
 }
+
+// ---- feed (bbs view) -------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct FeedRow {
+    pub created_at: String,
+    pub from_kind: Kind,
+    pub from_name: String,
+    pub to_group: Option<String>,
+    /// Recipient of a direct message; `None` for broadcasts.
+    pub to_name: Option<String>,
+    /// When a direct message was read; always `None` for broadcasts.
+    pub read_at: Option<String>,
+    pub body: String,
+}
+
+/// The most recent `limit` messages across the whole board, oldest first. Each
+/// broadcast appears once, regardless of how many deliveries it fanned out to.
+pub fn recent_messages(conn: &Connection, limit: u32) -> Result<Vec<FeedRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT m.created_at, m.from_kind, COALESCE(fa.name, fh.name), g.name,
+                COALESCE(ta.name, th.name), d.archived_at, m.body
+         FROM messages m
+         LEFT JOIN agents fa ON m.from_kind = 'agent' AND fa.id = m.from_id
+         LEFT JOIN humans fh ON m.from_kind = 'human' AND fh.id = m.from_id
+         LEFT JOIN bbs_groups g ON g.id = m.to_group_id
+         LEFT JOIN deliveries d ON m.to_group_id IS NULL AND d.message_id = m.id
+         LEFT JOIN agents ta ON d.recipient_kind = 'agent' AND ta.id = d.recipient_id
+         LEFT JOIN humans th ON d.recipient_kind = 'human' AND th.id = d.recipient_id
+         ORDER BY m.id DESC
+         LIMIT ?1",
+    )?;
+    let mut rows: Vec<FeedRow> = stmt
+        .query_map(params![limit], |r| {
+            let from_kind: String = r.get(1)?;
+            Ok(FeedRow {
+                created_at: r.get(0)?,
+                from_kind: if from_kind == "human" {
+                    Kind::Human
+                } else {
+                    Kind::Agent
+                },
+                from_name: r.get(2)?,
+                to_group: r.get(3)?,
+                to_name: r.get(4)?,
+                read_at: r.get(5)?,
+                body: r.get(6)?,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+    rows.reverse();
+    Ok(rows)
+}
+
+pub fn data_version(conn: &Connection) -> Result<i64> {
+    Ok(conn.pragma_query_value(None, "data_version", |r| r.get(0))?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn feed_shows_broadcasts_once_and_dm_read_times() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        let t = "2026-10-09T00:00:00.000000Z";
+        let will = Principal {
+            kind: Kind::Human,
+            id: insert_human(&conn, "will", t).unwrap(),
+            name: "will".into(),
+        };
+        let agent = |name: &str, token: &str| {
+            let a = NewAgent {
+                name,
+                token,
+                status: None,
+                pwd: "/",
+                hostname: "h",
+                now: t,
+            };
+            Principal {
+                kind: Kind::Agent,
+                id: insert_agent(&conn, &a).unwrap(),
+                name: name.into(),
+            }
+        };
+        let (a, b, c) = (
+            agent("Aiko", "t1"),
+            agent("Bram", "t2"),
+            agent("Cian", "t3"),
+        );
+        let g = insert_group(&conn, "acme", t).unwrap();
+
+        let m = insert_message(&conn, &a, Some(g), "hello all", t).unwrap();
+        for p in [&b, &c, &will] {
+            insert_delivery(&conn, m, p.kind, p.id).unwrap();
+        }
+        let m = insert_message(&conn, &will, None, "hi Bram", t).unwrap();
+        insert_delivery(&conn, m, Kind::Agent, b.id).unwrap();
+
+        let feed = recent_messages(&conn, 10).unwrap();
+        assert_eq!(feed.len(), 2);
+        assert_eq!(
+            (feed[0].to_group.as_deref(), feed[0].to_name.as_deref()),
+            (Some("acme"), None)
+        );
+        assert_eq!(feed[0].read_at, None);
+        assert_eq!(feed[1].from_name, "will");
+        assert_eq!(feed[1].to_name.as_deref(), Some("Bram"));
+        assert_eq!(feed[1].read_at, None);
+
+        take_unread(&conn, &b, None, None, "2026-10-09T01:00:00.000000Z").unwrap();
+        let feed = recent_messages(&conn, 10).unwrap();
+        assert_eq!(feed[0].read_at, None, "broadcast read times stay hidden");
+        assert_eq!(
+            feed[1].read_at.as_deref(),
+            Some("2026-10-09T01:00:00.000000Z")
+        );
+    }
+}

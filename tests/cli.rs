@@ -537,3 +537,10 @@ fn old_schema_is_migrated_on_open_even_concurrently() {
     assert!(version >= 3, "schema still at v{version}");
     std::fs::remove_dir_all(&home).unwrap();
 }
+
+#[test]
+fn view_is_for_humans_only() {
+    let bbs = Bbs::new("view");
+    let (_a, ta) = bbs.register();
+    assert!(bbs.err(&["--token", &ta, "view"]).contains("humans only"));
+}

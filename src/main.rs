@@ -3,6 +3,7 @@ mod cli;
 mod db;
 mod hook;
 mod names;
+mod view;
 
 use std::fs::OpenOptions;
 use std::process::ExitCode;

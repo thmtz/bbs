@@ -70,6 +70,8 @@ pub enum Command {
         #[arg(long, conflicts_with = "archived")]
         wait: bool,
     },
+    /// Watch every message on the board as it flows (humans only; read-only).
+    View,
     /// Handle a harness hook event (JSON on stdin). Never fails the harness.
     Hook {
         #[arg(value_enum)]
