@@ -10,6 +10,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_sessions.sql"),
+    include_str!("../migrations/0003_agents_active_index.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +182,15 @@ pub fn live_agent_by_name(conn: &Connection, name: &str) -> Result<Option<Princi
             agent_principal,
         )
         .optional()?)
+}
+
+pub fn agent_is_live(conn: &Connection, id: i64) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM agents WHERE id = ?1 AND retired_at IS NULL",
+        params![id],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
 }
 
 pub fn retired_agent_exists(conn: &Connection, name: &str) -> Result<bool> {
@@ -466,6 +476,16 @@ fn message_view(r: &rusqlite::Row) -> rusqlite::Result<MessageView> {
         to_group: r.get(4)?,
         body: r.get(5)?,
     })
+}
+
+pub fn has_unread(conn: &Connection, me: &Principal) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM deliveries
+         WHERE recipient_kind = ?1 AND recipient_id = ?2 AND archived_at IS NULL)",
+        params![me.kind.as_str(), me.id],
+        |r| r.get(0),
+    )?;
+    Ok(n != 0)
 }
 
 /// Fetch unread messages oldest-first and mark them archived. `from_kind`

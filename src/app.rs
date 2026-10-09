@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -14,6 +15,8 @@ use crate::names::NAMES;
 
 const RETIRE_AFTER_DAYS: i64 = 7;
 const MAX_BODY_BYTES: usize = 64 * 1024;
+const WAIT_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const WAIT_TOUCH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 pub fn home_dir() -> Result<PathBuf> {
     std::env::var_os("HOME")
@@ -47,6 +50,20 @@ pub fn run(cli: Cli) -> Result<()> {
     }
     let mut conn = db::open(&db_path)?;
     db::check_schema(&conn)?;
+    let wait = matches!(cli.command, Command::Read { wait: true, .. });
+    loop {
+        let out = with_ctx(&mut conn, &cli, |ctx| dispatch(ctx, &cli.command))?;
+        if !out.is_empty() || !wait {
+            print!("{out}");
+            return Ok(());
+        }
+        // Another reader of the same inbox may win the race; keep waiting until we get mail.
+        wait_for_unread(&mut conn, &cli)?;
+    }
+}
+
+/// Run `f` in its own immediate (write-locking) transaction.
+fn with_ctx<T>(conn: &mut Connection, cli: &Cli, f: impl FnOnce(&Ctx) -> Result<T>) -> Result<T> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let now = Utc::now();
     let ctx = Ctx {
@@ -56,31 +73,63 @@ pub fn run(cli: Cli) -> Result<()> {
         token: cli.token.as_deref(),
         as_human: cli.as_human.as_deref(),
     };
-    let out = match cli.command {
+    let out = f(&ctx)?;
+    tx.commit()?;
+    Ok(out)
+}
+
+fn dispatch(ctx: &Ctx, command: &Command) -> Result<String> {
+    match command {
         Command::Init { .. } | Command::Hook { .. } => unreachable!(),
         Command::Human {
             command: HumanCommand::Add { name },
-        } => human_add(&ctx, &name)?,
+        } => human_add(ctx, name),
         Command::Group { command } => match command {
-            GroupCommand::Register { group } => group_register(&ctx, &group)?,
-            GroupCommand::Join { group } => group_join(&ctx, &group)?,
-            GroupCommand::Leave { group } => group_leave(&ctx, &group)?,
-            GroupCommand::List => group_list(&ctx)?,
+            GroupCommand::Register { group } => group_register(ctx, group),
+            GroupCommand::Join { group } => group_join(ctx, group),
+            GroupCommand::Leave { group } => group_leave(ctx, group),
+            GroupCommand::List => group_list(ctx),
         },
-        Command::Register { note } => register(&ctx, note.as_deref())?,
-        Command::Status { text } => status(&ctx, &text)?,
-        Command::Bye => bye(&ctx)?,
-        Command::Send { to, body } => send(&ctx, &to, body)?,
+        Command::Register { note } => register(ctx, note.as_deref()),
+        Command::Status { text } => status(ctx, text),
+        Command::Bye => bye(ctx),
+        Command::Send { to, body } => send(ctx, to, body.clone()),
         Command::Read {
             limit,
             archived,
             since,
-        } => read(&ctx, limit, archived, since.as_deref())?,
-        Command::Agents { all } => agents(&ctx, all)?,
-    };
-    tx.commit()?;
-    print!("{out}");
-    Ok(())
+            ..
+        } => read(ctx, *limit, *archived, since.as_deref()),
+        Command::Agents { all } => agents(ctx, *all),
+    }
+}
+
+/// Block until the caller has unread mail. Never holds a transaction while idle:
+/// `PRAGMA data_version` changes only when another connection commits, so we
+/// poll it once a second and run the unread query only after a change.
+fn wait_for_unread(conn: &mut Connection, cli: &Cli) -> Result<()> {
+    let me = with_ctx(conn, cli, |ctx| ctx.actor())?;
+    tracing::info!(reader = me.name, "waiting for mail");
+    let mut seen_version = None;
+    let mut last_touch = Instant::now();
+    loop {
+        let version: i64 = conn.pragma_query_value(None, "data_version", |r| r.get(0))?;
+        if seen_version != Some(version) {
+            seen_version = Some(version);
+            if me.kind == Kind::Agent && !db::agent_is_live(conn, me.id)? {
+                bail!("{} was retired while waiting", me.name);
+            }
+            if db::has_unread(conn, &me)? {
+                return Ok(());
+            }
+        }
+        // A waiting agent is alive; keep it clear of stale-agent retirement.
+        if last_touch.elapsed() >= WAIT_TOUCH_INTERVAL {
+            with_ctx(conn, cli, |ctx| ctx.actor())?;
+            last_touch = Instant::now();
+        }
+        std::thread::sleep(WAIT_POLL_INTERVAL);
+    }
 }
 
 struct Ctx<'a> {

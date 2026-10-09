@@ -411,3 +411,85 @@ fn codex_hooks_bind_from_string_tool_response() {
     // Delivered via the hook, so nothing is left unread.
     assert_eq!(bbs.ok(&["--token", token, "read"]), "");
 }
+
+impl Bbs {
+    fn spawn(&self, args: &[&str]) -> std::process::Child {
+        Command::new(env!("CARGO_BIN_EXE_bbs"))
+            .args(args)
+            .env("HOME", &self.home)
+            .env("USER", "will")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+}
+
+/// Wait up to `secs` for the child to exit.
+fn wait_exit(child: &mut std::process::Child, secs: u64) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while std::time::Instant::now() < deadline {
+        if let Some(status) = child.try_wait().unwrap() {
+            return Some(status);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    None
+}
+
+#[test]
+fn read_wait_blocks_until_mail_arrives() {
+    let bbs = Bbs::new("wait");
+    let (a, ta) = bbs.register();
+    let (b, _tb) = bbs.register();
+    assert!(
+        bbs.err(&["read", "--wait", "--archived"])
+            .contains("cannot be used with")
+    );
+
+    // Already-unread mail returns immediately.
+    bbs.ok(&["send", "--to", &a, "early"]);
+    assert!(
+        bbs.ok(&["--token", &ta, "read", "--wait"])
+            .contains("early")
+    );
+
+    let mut child = bbs.spawn(&["--token", &ta, "read", "--wait"]);
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(child.try_wait().unwrap().is_none(), "returned without mail");
+
+    // Mail for someone else does not wake it.
+    bbs.ok(&["send", "--to", &b, "not for a"]);
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "woke for another inbox"
+    );
+
+    let sent = std::time::Instant::now();
+    bbs.ok(&["send", "--to", &a, "wake up"]);
+    let status = wait_exit(&mut child, 5).expect("read --wait did not wake");
+    assert!(status.success());
+    assert!(sent.elapsed() < std::time::Duration::from_millis(2500));
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("wake up") && !stdout.contains("not for a"),
+        "{stdout}"
+    );
+    assert_eq!(bbs.ok(&["--token", &ta, "read"]), "");
+}
+
+#[test]
+fn read_wait_fails_if_retired_while_waiting() {
+    let bbs = Bbs::new("wait-retired");
+    let (_a, ta) = bbs.register();
+    let mut child = bbs.spawn(&["--token", &ta, "read", "--wait"]);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    bbs.ok(&["--token", &ta, "bye"]);
+    let status = wait_exit(&mut child, 5).expect("waiter did not notice retirement");
+    assert!(!status.success());
+    let err = String::from_utf8(child.wait_with_output().unwrap().stderr).unwrap();
+    assert!(err.contains("retired"), "{err}");
+}

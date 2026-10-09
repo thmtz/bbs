@@ -66,6 +66,9 @@ pub enum Command {
         /// With --archived: only messages sent at or after this time (RFC3339, or a duration like 2h, 7d).
         #[arg(long, requires = "archived")]
         since: Option<String>,
+        /// Block until at least one unread message arrives, then print it.
+        #[arg(long, conflicts_with = "archived")]
+        wait: bool,
     },
     /// Handle a harness hook event (JSON on stdin). Never fails the harness.
     Hook {
