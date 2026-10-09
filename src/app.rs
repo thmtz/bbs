@@ -49,7 +49,7 @@ pub fn run(cli: Cli) -> Result<()> {
         bail!("BBS is not initialized; run `bbs init`");
     }
     let mut conn = db::open(&db_path)?;
-    db::check_schema(&conn)?;
+    db::migrate(&mut conn)?;
     let wait = matches!(cli.command, Command::Read { wait: true, .. });
     loop {
         let out = with_ctx(&mut conn, &cli, |ctx| dispatch(ctx, &cli.command))?;

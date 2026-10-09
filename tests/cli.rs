@@ -493,3 +493,47 @@ fn read_wait_fails_if_retired_while_waiting() {
     let err = String::from_utf8(child.wait_with_output().unwrap().stderr).unwrap();
     assert!(err.contains("retired"), "{err}");
 }
+
+#[test]
+fn old_schema_is_migrated_on_open_even_concurrently() {
+    let home = std::env::temp_dir().join(format!("bbs-test-{}-migrate", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let state = home.join(".local/state/bbs");
+    std::fs::create_dir_all(&state).unwrap();
+    let db = rusqlite::Connection::open(state.join("bbs.db")).unwrap();
+    db.execute_batch(include_str!("../migrations/0001_init.sql"))
+        .unwrap();
+    db.execute_batch(
+        "PRAGMA user_version = 1;
+         INSERT INTO humans (name, created_at, active_at) VALUES ('will', 'x', 'x');",
+    )
+    .unwrap();
+    drop(db);
+
+    let children: Vec<_> = (0..8)
+        .map(|_| {
+            Command::new(env!("CARGO_BIN_EXE_bbs"))
+                .arg("agents")
+                .env("HOME", &home)
+                .env("USER", "will")
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for child in children {
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let db = rusqlite::Connection::open(state.join("bbs.db")).unwrap();
+    let version: i64 = db
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert!(version >= 3, "schema still at v{version}");
+    std::fs::remove_dir_all(&home).unwrap();
+}

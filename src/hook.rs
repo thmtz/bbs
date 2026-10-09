@@ -28,7 +28,7 @@ fn handle(harness: Harness, db_path: &Path) -> Result<()> {
     }
     let event: Value = serde_json::from_str(&input).context("parsing hook input")?;
     let mut conn = db::open(db_path)?;
-    db::check_schema(&conn)?;
+    db::migrate(&mut conn)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let output = handle_event(&tx, harness.as_str(), &event)?;
     tx.commit()?;

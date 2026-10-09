@@ -3,9 +3,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
 
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
@@ -64,10 +65,36 @@ pub struct MessageView {
 
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    enable_wal(&conn)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     Ok(conn)
+}
+
+/// WAL is persistent, so this normally just reads the mode. Switching needs an
+/// exclusive lock that the busy timeout does not cover, so retry while contended.
+fn enable_wal(conn: &Connection) -> Result<()> {
+    let mode: String = conn.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
+    if mode.eq_ignore_ascii_case("wal") {
+        return Ok(());
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get::<_, String>(0)) {
+            Ok(_) => return Ok(()),
+            Err(err) if is_busy(&err) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(err) => return Err(err).context("enabling WAL"),
+        }
+    }
+}
+
+fn is_busy(err: &rusqlite::Error) -> bool {
+    matches!(
+        err.sqlite_error_code(),
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
 }
 
 fn schema_version(conn: &Connection) -> Result<usize> {
@@ -75,27 +102,24 @@ fn schema_version(conn: &Connection) -> Result<usize> {
     Ok(v as usize)
 }
 
+/// Bring the schema up to date. Every command calls this on open; concurrent
+/// callers serialize on the write lock and re-check the version under it.
 pub fn migrate(conn: &mut Connection) -> Result<()> {
-    let current = schema_version(conn)?;
-    for (i, sql) in MIGRATIONS.iter().enumerate().skip(current) {
-        let tx = conn.transaction()?;
-        tx.execute_batch(sql)
-            .with_context(|| format!("applying migration {}", i + 1))?;
-        tx.pragma_update(None, "user_version", (i + 1) as i64)?;
-        tx.commit()?;
-        tracing::info!(version = i + 1, "applied migration");
+    if schema_version(conn)? == MIGRATIONS.len() {
+        return Ok(());
     }
-    Ok(())
-}
-
-pub fn check_schema(conn: &Connection) -> Result<()> {
-    let current = schema_version(conn)?;
-    if current < MIGRATIONS.len() {
-        bail!("BBS schema is out of date (v{current}); run `bbs init`");
-    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current = schema_version(&tx)?;
     if current > MIGRATIONS.len() {
         bail!("BBS schema v{current} is newer than this binary supports");
     }
+    for (i, sql) in MIGRATIONS.iter().enumerate().skip(current) {
+        tx.execute_batch(sql)
+            .with_context(|| format!("applying migration {}", i + 1))?;
+        tracing::info!(version = i + 1, "applied migration");
+    }
+    tx.pragma_update(None, "user_version", MIGRATIONS.len() as i64)?;
+    tx.commit()?;
     Ok(())
 }
 
