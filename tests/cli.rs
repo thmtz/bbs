@@ -126,14 +126,18 @@ fn direct_messages_within_group() {
 }
 
 #[test]
-fn humans_reach_and_are_reached_by_anyone() {
+fn humans_message_agents_and_humans_but_agents_cannot_dm_humans() {
     let bbs = Bbs::new("human");
+    bbs.ok(&["human", "add", "alice"]);
     let (a, ta) = bbs.register();
-    bbs.ok(&["--token", &ta, "send", "--to", "will", "need input"]);
-    let out = bbs.ok(&["read"]);
     assert!(
-        out.contains(&format!("from {a} to will:\nneed input")),
-        "{out}"
+        bbs.err(&["--token", &ta, "send", "--to", "will", "need input"])
+            .contains("through your harness")
+    );
+    bbs.ok(&["send", "--to", "alice", "lunch?"]);
+    assert!(
+        bbs.ok(&["--as", "alice", "read"])
+            .contains("from will (human) to alice:\nlunch?")
     );
 
     assert!(bbs.err(&["send", "--to", &a, "-"]).contains("empty"));
@@ -160,7 +164,7 @@ fn broadcast_reaches_members_and_humans() {
             .contains("not a member")
     );
     let out = bbs.ok(&["--token", &ta, "send", "--to", "@acme", "standup"]);
-    assert!(out.contains("3 recipients"), "{out}"); // b, will, alice
+    assert!(out.contains("1 recipients"), "{out}"); // humans are not counted for agents
 
     assert!(
         bbs.ok(&["--token", &tb, "read"])
@@ -169,6 +173,13 @@ fn broadcast_reaches_members_and_humans() {
     assert_eq!(bbs.ok(&["--token", &ta, "read"]), "");
     assert_eq!(bbs.ok(&["--token", &tc, "read"]), "");
     assert!(bbs.ok(&["--as", "alice", "read"]).contains("standup"));
+
+    let out = bbs.ok(&["send", "--to", "@acme", "from a human"]);
+    assert!(out.contains("3 recipients"), "{out}"); // both agents + alice
+    assert!(
+        bbs.ok(&["--token", &ta, "read"])
+            .contains("from will (human) to @acme")
+    );
 }
 
 #[test]
@@ -257,7 +268,8 @@ fn agents_lists_status_and_scopes_visibility() {
         "{seen_by_a}"
     );
     assert!(!seen_by_a.contains(&c), "{seen_by_a}");
-    assert!(seen_by_a.contains("will"));
+    assert!(!seen_by_a.contains("will"), "{seen_by_a}");
     let seen_by_human = bbs.ok(&["agents"]);
     assert!(seen_by_human.contains(&a) && seen_by_human.contains(&c));
+    assert!(seen_by_human.contains("will"));
 }

@@ -356,7 +356,9 @@ fn send(ctx: &Ctx, to: &str, body: Option<String>) -> Result<String> {
             bail!("you are not a member of @{group}");
         }
         let msg = db::insert_message(ctx.conn, &me, Some(gid), &body, &ctx.now_s)?;
+        // Humans silently receive every broadcast; agents only see the agent count.
         let mut count = 0;
+        let mut visible = 0;
         let agents = db::group_member_ids(ctx.conn, gid)?
             .into_iter()
             .map(|id| (Kind::Agent, id));
@@ -369,9 +371,12 @@ fn send(ctx: &Ctx, to: &str, body: Option<String>) -> Result<String> {
             }
             db::insert_delivery(ctx.conn, msg, kind, id)?;
             count += 1;
+            if me.kind == Kind::Human || kind == Kind::Agent {
+                visible += 1;
+            }
         }
         tracing::info!(from = me.name, to = %format!("@{group}"), recipients = count, bytes = body.len(), "sent broadcast");
-        return Ok(format!("Sent to @{group} ({count} recipients).\n"));
+        return Ok(format!("Sent to @{group} ({visible} recipients).\n"));
     }
 
     let target = match db::find_human(ctx.conn, to)? {
@@ -384,6 +389,12 @@ fn send(ctx: &Ctx, to: &str, body: Option<String>) -> Result<String> {
     };
     if target.kind == me.kind && target.id == me.id {
         bail!("cannot send a message to yourself");
+    }
+    if me.kind == Kind::Agent && target.kind == Kind::Human {
+        bail!(
+            "agents cannot message humans; talk to {} through your harness",
+            target.name
+        );
     }
     if me.kind == Kind::Agent
         && target.kind == Kind::Agent
@@ -474,7 +485,12 @@ fn agents(ctx: &Ctx, all: bool) -> Result<String> {
         "WHERE".into(),
         "STATUS".into(),
     ]];
-    for h in db::list_humans(ctx.conn)? {
+    // Agents cannot message humans, so humans are not listed for them.
+    let humans = match me.kind {
+        Kind::Human => db::list_humans(ctx.conn)?,
+        Kind::Agent => Vec::new(),
+    };
+    for h in humans {
         table.push([
             h.name,
             "human".into(),
