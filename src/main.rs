@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod db;
+mod hook;
 mod names;
 
 use std::fs::OpenOptions;

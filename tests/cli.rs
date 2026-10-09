@@ -273,3 +273,95 @@ fn agents_lists_status_and_scopes_visibility() {
     assert!(seen_by_human.contains(&a) && seen_by_human.contains(&c));
     assert!(seen_by_human.contains("will"));
 }
+
+fn hook(bbs: &Bbs, event: serde_json::Value) -> Option<serde_json::Value> {
+    let out = bbs.run_with_stdin(&["hook", "claude-code"], &event.to_string());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    (!stdout.trim().is_empty()).then(|| serde_json::from_str(&stdout).unwrap())
+}
+
+#[test]
+fn claude_code_hooks_bind_and_deliver() {
+    let bbs = Bbs::new("hook");
+    bbs.ok(&["group", "register", "acme"]);
+    let register_out = bbs.ok(&["register"]);
+    let (a, ta) = (
+        register_out.split('"').nth(1).unwrap().to_string(),
+        register_out
+            .split("--token ")
+            .nth(1)
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap()
+            .to_string(),
+    );
+    let (b, tb) = bbs.register();
+    bbs.ok(&["--token", &ta, "group", "join", "acme"]);
+    bbs.ok(&["--token", &tb, "group", "join", "acme"]);
+    bbs.ok(&["send", "--to", &a, "before binding"]);
+
+    let post_tool = |command: &str, stdout: &str| {
+        serde_json::json!({
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": command },
+            "tool_response": { "stdout": stdout, "stderr": "", "interrupted": false, "isImage": false },
+        })
+    };
+    let event = |name: &str| serde_json::json!({ "session_id": "s1", "hook_event_name": name });
+
+    // Unbound sessions are a silent no-op.
+    assert!(hook(&bbs, event("UserPromptSubmit")).is_none());
+    assert!(hook(&bbs, serde_json::json!({"garbage": true})).is_none());
+
+    // Seeing `bbs register` output binds the session and delivers pending mail.
+    let out = hook(&bbs, post_tool("bbs register --note x", &register_out)).unwrap();
+    let ctx = out["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert_eq!(out["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+    assert!(ctx.contains("before binding"), "{ctx}");
+    assert!(hook(&bbs, post_tool("ls", "")).is_none());
+
+    // Stop only blocks for human messages.
+    bbs.ok(&["--token", &tb, "send", "--to", &a, "agent chatter"]);
+    assert!(hook(&bbs, event("Stop")).is_none());
+    bbs.ok(&["send", "--to", &a, "human says stop"]);
+    let out = hook(&bbs, event("Stop")).unwrap();
+    assert_eq!(out["decision"], "block");
+    let reason = out["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("human says stop") && !reason.contains("agent chatter"),
+        "{reason}"
+    );
+
+    // The agent message is still waiting for the next prompt.
+    let out = hook(&bbs, event("UserPromptSubmit")).unwrap();
+    assert!(
+        out["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("from {b}"))
+    );
+
+    // After compaction the identity is re-injected.
+    let out = hook(&bbs, serde_json::json!({ "session_id": "s1", "hook_event_name": "SessionStart", "source": "compact" })).unwrap();
+    assert!(
+        out["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains(&ta)
+    );
+
+    // Re-registering in the same session retires the old identity.
+    let second = bbs.ok(&["register"]);
+    hook(&bbs, post_tool("bbs register", &second));
+    assert!(bbs.err(&["--token", &ta, "read"]).contains("retired"));
+}

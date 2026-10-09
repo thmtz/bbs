@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -67,6 +67,11 @@ pub enum Command {
         #[arg(long, requires = "archived")]
         since: Option<String>,
     },
+    /// Handle a harness hook event (JSON on stdin). Never fails the harness.
+    Hook {
+        #[arg(value_enum)]
+        harness: Harness,
+    },
     /// List known agents and humans with their last activity.
     Agents {
         /// Include retired agents (humans only).
@@ -91,4 +96,17 @@ pub enum GroupCommand {
     Leave { group: String },
     /// List groups and their members.
     List,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+pub enum Harness {
+    ClaudeCode,
+}
+
+impl Harness {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Harness::ClaudeCode => "claude-code",
+        }
+    }
 }

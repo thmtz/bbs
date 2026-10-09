@@ -21,11 +21,11 @@ pub fn home_dir() -> Result<PathBuf> {
         .context("$HOME is not set")
 }
 
-fn state_dir() -> Result<PathBuf> {
+pub(crate) fn state_dir() -> Result<PathBuf> {
     Ok(home_dir()?.join(".local/state/bbs"))
 }
 
-fn fmt_time(t: DateTime<Utc>) -> String {
+pub(crate) fn fmt_time(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(SecondsFormat::Micros, true)
 }
 
@@ -37,8 +37,10 @@ fn display_time(stored: &str) -> String {
 pub fn run(cli: Cli) -> Result<()> {
     let dir = state_dir()?;
     let db_path = dir.join("bbs.db");
-    if let Command::Init { human } = &cli.command {
-        return init(&dir, &db_path, human.as_deref());
+    match &cli.command {
+        Command::Init { human } => return init(&dir, &db_path, human.as_deref()),
+        Command::Hook { harness } => return crate::hook::run(*harness, &db_path),
+        _ => {}
     }
     if !db_path.exists() {
         bail!("BBS is not initialized; run `bbs init`");
@@ -55,7 +57,7 @@ pub fn run(cli: Cli) -> Result<()> {
         as_human: cli.as_human.as_deref(),
     };
     let out = match cli.command {
-        Command::Init { .. } => unreachable!(),
+        Command::Init { .. } | Command::Hook { .. } => unreachable!(),
         Command::Human {
             command: HumanCommand::Add { name },
         } => human_add(&ctx, &name)?,
@@ -308,8 +310,13 @@ fn register(ctx: &Ctx, note: Option<&str>) -> Result<String> {
     )?;
     tracing::info!(agent_id = id, name, pwd, hostname, "registered agent");
     Ok(format!(
-        "Welcome to the BBS. Your name is \"{name}\", access BBS with `bbs --token {token} ...`\n"
+        "Welcome to the BBS. {}\n",
+        identity_line(&name, &token)
     ))
+}
+
+pub(crate) fn identity_line(name: &str, token: &str) -> String {
+    format!("Your name is \"{name}\", access BBS with `bbs --token {token} ...`")
 }
 
 fn status(ctx: &Ctx, text: &str) -> Result<String> {
@@ -429,12 +436,16 @@ fn read(ctx: &Ctx, limit: Option<u32>, archived: bool, since: Option<&str>) -> R
         let since = since.map(|s| parse_since(s, ctx.now)).transpose()?;
         db::archived_since(ctx.conn, &me, since.as_deref(), limit)?
     } else {
-        let msgs = db::take_unread(ctx.conn, &me, limit, &ctx.now_s)?;
+        let msgs = db::take_unread(ctx.conn, &me, None, limit, &ctx.now_s)?;
         if !msgs.is_empty() {
             tracing::info!(reader = me.name, count = msgs.len(), "archived messages");
         }
         msgs
     };
+    format_messages(&me, &msgs)
+}
+
+pub(crate) fn format_messages(me: &Principal, msgs: &[db::MessageView]) -> Result<String> {
     let mut out = String::new();
     for (i, m) in msgs.iter().enumerate() {
         if i > 0 {

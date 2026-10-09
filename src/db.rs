@@ -7,7 +7,10 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 
-const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_init.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/0001_init.sql"),
+    include_str!("../migrations/0002_sessions.sql"),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -465,19 +468,27 @@ fn message_view(r: &rusqlite::Row) -> rusqlite::Result<MessageView> {
     })
 }
 
-/// Fetch unread messages oldest-first and mark them archived.
+/// Fetch unread messages oldest-first and mark them archived. `from_kind`
+/// restricts this to messages sent by humans or by agents.
 pub fn take_unread(
     conn: &Connection,
     me: &Principal,
+    from_kind: Option<Kind>,
     limit: Option<u32>,
     now: &str,
 ) -> Result<Vec<MessageView>> {
-    let sql =
-        format!("{INBOX_SELECT} AND d.archived_at IS NULL ORDER BY m.created_at, m.id LIMIT ?3");
+    let sql = format!(
+        "{INBOX_SELECT} AND d.archived_at IS NULL AND (?3 IS NULL OR m.from_kind = ?3)
+         ORDER BY m.created_at, m.id LIMIT ?4"
+    );
     let limit = limit.map_or(i64::MAX, i64::from);
+    let from_kind = from_kind.map(Kind::as_str);
     let msgs: Vec<MessageView> = conn
         .prepare(&sql)?
-        .query_map(params![me.kind.as_str(), me.id, limit], message_view)?
+        .query_map(
+            params![me.kind.as_str(), me.id, from_kind, limit],
+            message_view,
+        )?
         .collect::<Result<_, _>>()?;
     let mut archive = conn.prepare(
         "UPDATE deliveries SET archived_at = ?1
@@ -505,4 +516,45 @@ pub fn archived_since(
         .query_map(params![me.kind.as_str(), me.id, since, limit], message_view)?
         .collect::<Result<_, _>>()?;
     Ok(msgs)
+}
+
+// ---- harness sessions ------------------------------------------------------
+
+/// Bind a harness session to an agent, returning the agent it was previously bound to.
+pub fn bind_session(
+    conn: &Connection,
+    harness: &str,
+    session_id: &str,
+    agent_id: i64,
+    now: &str,
+) -> Result<Option<i64>> {
+    let previous: Option<i64> = conn
+        .query_row(
+            "SELECT agent_id FROM sessions WHERE harness = ?1 AND session_id = ?2",
+            params![harness, session_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    conn.execute(
+        "INSERT INTO sessions (harness, session_id, agent_id, bound_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (harness, session_id) DO UPDATE SET agent_id = ?3, bound_at = ?4",
+        params![harness, session_id, agent_id, now],
+    )?;
+    Ok(previous.filter(|&id| id != agent_id))
+}
+
+/// The live agent bound to a harness session, with its token.
+pub fn session_agent(
+    conn: &Connection,
+    harness: &str,
+    session_id: &str,
+) -> Result<Option<(Principal, String)>> {
+    Ok(conn
+        .query_row(
+            "SELECT a.id, a.name, a.token FROM sessions s JOIN agents a ON a.id = s.agent_id
+             WHERE s.harness = ?1 AND s.session_id = ?2 AND a.retired_at IS NULL",
+            params![harness, session_id],
+            |r| Ok((agent_principal(r)?, r.get(2)?)),
+        )
+        .optional()?)
 }
