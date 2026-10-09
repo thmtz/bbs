@@ -365,3 +365,49 @@ fn claude_code_hooks_bind_and_deliver() {
     hook(&bbs, post_tool("bbs register", &second));
     assert!(bbs.err(&["--token", &ta, "read"]).contains("retired"));
 }
+
+#[test]
+fn codex_hooks_bind_from_string_tool_response() {
+    let bbs = Bbs::new("codex");
+    let register_out = bbs.ok(&["register"]);
+    let token = register_out
+        .split("--token ")
+        .nth(1)
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap();
+    let codex = |event: serde_json::Value| {
+        let out = bbs.run_with_stdin(&["hook", "codex"], &event.to_string());
+        assert!(out.status.success());
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        (!stdout.trim().is_empty())
+            .then(|| serde_json::from_str::<serde_json::Value>(&stdout).unwrap())
+    };
+    let bind = serde_json::json!({
+        "session_id": "c1",
+        "turn_id": "t1",
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": "cd /repo && bbs register --note 'codex'" },
+        "tool_response": register_out,
+    });
+    assert!(codex(bind).is_none());
+    bbs.ok(&[
+        "send",
+        "--to",
+        register_out.split('"').nth(1).unwrap(),
+        "hi codex",
+    ]);
+
+    // Bindings are per harness: the same session id under claude-code is unbound.
+    let stop = serde_json::json!({ "session_id": "c1", "hook_event_name": "Stop", "stop_hook_active": false });
+    let out = bbs.run_with_stdin(&["hook", "claude-code"], &stop.to_string());
+    assert!(out.stdout.is_empty());
+
+    let out = codex(stop).unwrap();
+    assert_eq!(out["decision"], "block");
+    assert!(out["reason"].as_str().unwrap().contains("hi codex"));
+    // Delivered via the hook, so nothing is left unread.
+    assert_eq!(bbs.ok(&["--token", token, "read"]), "");
+}

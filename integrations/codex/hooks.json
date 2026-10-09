@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "matcher": "compact", "hooks": [{ "type": "command", "command": "bbs hook codex", "timeout": 10 }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "bbs hook codex", "timeout": 10 }] }
+    ],
+    "PostToolUse": [
+      { "hooks": [{ "type": "command", "command": "bbs hook codex", "timeout": 10 }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "bbs hook codex", "timeout": 10 }] }
+    ]
+  }
+}

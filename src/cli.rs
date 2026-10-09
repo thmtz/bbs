@@ -101,12 +101,14 @@ pub enum GroupCommand {
 #[derive(ValueEnum, Clone, Copy, Debug)]
 pub enum Harness {
     ClaudeCode,
+    Codex,
 }
 
 impl Harness {
     pub fn as_str(self) -> &'static str {
         match self {
             Harness::ClaudeCode => "claude-code",
+            Harness::Codex => "codex",
         }
     }
 }

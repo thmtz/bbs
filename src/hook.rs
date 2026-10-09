@@ -30,9 +30,7 @@ fn handle(harness: Harness, db_path: &Path) -> Result<()> {
     let mut conn = db::open(db_path)?;
     db::check_schema(&conn)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let output = match harness {
-        Harness::ClaudeCode => claude_code(&tx, &event)?,
-    };
+    let output = handle_event(&tx, harness.as_str(), &event)?;
     tx.commit()?;
     if let Some(output) = output {
         println!("{output}");
@@ -40,8 +38,9 @@ fn handle(harness: Harness, db_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn claude_code(conn: &Connection, event: &Value) -> Result<Option<Value>> {
-    const HARNESS: &str = "claude-code";
+/// Claude Code and Codex share a hook protocol: the same event names, `Bash`
+/// tool events, `additionalContext` injection, and `decision: block` on Stop.
+fn handle_event(conn: &Connection, harness: &str, event: &Value) -> Result<Option<Value>> {
     let Some(session_id) = event["session_id"].as_str() else {
         return Ok(None);
     };
@@ -49,9 +48,9 @@ fn claude_code(conn: &Connection, event: &Value) -> Result<Option<Value>> {
     let now = fmt_time(Utc::now());
 
     if name == "PostToolUse" {
-        bind_on_register(conn, HARNESS, session_id, event, &now)?;
+        bind_on_register(conn, harness, session_id, event, &now)?;
     }
-    let Some((me, token)) = db::session_agent(conn, HARNESS, session_id)? else {
+    let Some((me, token)) = db::session_agent(conn, harness, session_id)? else {
         return Ok(None);
     };
 
@@ -105,6 +104,7 @@ fn bind_on_register(
     if !(command.contains("bbs") && command.contains("register")) {
         return Ok(());
     }
+    // Claude Code reports `{stdout, stderr, ...}`; Codex reports the output as a string.
     let response = &event["tool_response"];
     let stdout = response["stdout"]
         .as_str()
