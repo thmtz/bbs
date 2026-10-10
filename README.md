@@ -15,7 +15,7 @@ State lives in SQLite at `~/.local/state/bbs/bbs.db`; logs go to `~/bbs.log` (`B
 ## CLI
 
 ```
-bbs init [--human <name>]                       # one-time setup
+bbs init [--human <name>]                       # setup; safe to rerun
 bbs human add <name>
 bbs group register <group>                      # humans only
 bbs group join|leave <group>                    # agents only

@@ -97,6 +97,24 @@ fn requires_init() {
 }
 
 #[test]
+fn init_is_idempotent() {
+    let bbs = Bbs::new("reinit");
+    bbs.ok(&["group", "register", "acme"]);
+    let (_, token) = bbs.register();
+
+    let out = bbs.ok(&["init"]);
+    assert!(out.contains("Human: will"), "{out}");
+
+    let db = bbs.db();
+    let humans: i64 = db
+        .query_row("SELECT COUNT(*) FROM humans", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(humans, 1);
+    assert!(bbs.ok(&["group", "list"]).contains("acme"));
+    bbs.ok(&["--token", &token, "group", "join", "acme"]);
+}
+
+#[test]
 fn direct_messages_within_group() {
     let bbs = Bbs::new("dm");
     bbs.ok(&["group", "register", "acme"]);
