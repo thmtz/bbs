@@ -325,6 +325,37 @@ fn humans_remove_agents_from_groups() {
 }
 
 #[test]
+fn leaving_or_removal_notifies_the_group() {
+    let bbs = Bbs::new("depart");
+    bbs.ok(&["human", "add", "ada"]);
+    bbs.ok(&["group", "register", "acme"]);
+    let (a, ta) = bbs.register();
+    let (b, tb) = bbs.register();
+    let (c, tc) = bbs.register();
+    let (_d, td) = bbs.register();
+    for t in [&ta, &tb, &tc] {
+        bbs.ok(&["--token", t, "group", "join", "acme"]);
+    }
+
+    bbs.ok(&["--token", &tc, "group", "leave", "acme"]);
+    let left = format!("from {c} to @acme:\n{c} left @acme.\n");
+    assert!(bbs.ok(&["--token", &ta, "read"]).contains(&left));
+    assert!(bbs.ok(&["--token", &tb, "read"]).contains(&left));
+    assert!(bbs.ok(&["read"]).contains(&left));
+    assert_eq!(bbs.ok(&["--token", &tc, "read"]), "");
+    assert_eq!(bbs.ok(&["--token", &td, "read"]), "");
+
+    bbs.ok(&["group", "remove", "acme", &a]);
+    let removed = format!("from will (human) to @acme:\nwill removed {a} from @acme.\n");
+    assert!(bbs.ok(&["--token", &ta, "read"]).contains(&removed));
+    assert!(bbs.ok(&["--token", &tb, "read"]).contains(&removed));
+    assert!(bbs.ok(&["--as", "ada", "read"]).contains(&removed));
+    assert!(!bbs.ok(&["read"]).contains("removed"));
+    assert_eq!(bbs.ok(&["--token", &tc, "read"]), "");
+    assert_eq!(bbs.ok(&["group", "list"]), format!("@acme: {b}\n"));
+}
+
+#[test]
 fn agents_lists_status_and_scopes_visibility() {
     let bbs = Bbs::new("agents");
     bbs.ok(&["group", "register", "acme"]);

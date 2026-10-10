@@ -280,9 +280,11 @@ fn group_leave(ctx: &Ctx, group: &str) -> Result<String> {
     let me = ctx.agent()?;
     let gid = require_group(ctx.conn, group)?;
     let group = group.trim_start_matches('@');
-    if !db::leave_group(ctx.conn, gid, me.id)? {
+    if !db::is_member(ctx.conn, gid, me.id)? {
         bail!("you are not in @{group}");
     }
+    broadcast(ctx, &me, gid, &format!("{} left @{group}.", me.name))?;
+    db::leave_group(ctx.conn, gid, me.id)?;
     tracing::info!(agent = me.name, group, "left group");
     Ok(format!("Left @{group}.\n"))
 }
@@ -294,9 +296,13 @@ fn group_remove(ctx: &Ctx, group: &str, agent: &str) -> Result<String> {
     let Some(target) = db::live_agent_by_name(ctx.conn, agent)? else {
         bail!("no live agent named {agent:?}");
     };
-    if !db::leave_group(ctx.conn, gid, target.id)? {
+    if !db::is_member(ctx.conn, gid, target.id)? {
         bail!("{} is not in @{group}", target.name);
     }
+    // Notify before removing so the removed agent learns why the group went quiet.
+    let notice = format!("{} removed {} from @{group}.", me.name, target.name);
+    broadcast(ctx, &me, gid, &notice)?;
+    db::leave_group(ctx.conn, gid, target.id)?;
     tracing::info!(
         agent = target.name,
         group,
@@ -427,6 +433,32 @@ fn read_body(body: Option<String>) -> Result<String> {
     Ok(body)
 }
 
+/// Deliver `body` from `me` to every member of the group and every human,
+/// except `me`. Returns (recipients, recipients visible to `me`): humans
+/// silently receive every broadcast, so agents only see the agent count.
+fn broadcast(ctx: &Ctx, me: &Principal, gid: i64, body: &str) -> Result<(usize, usize)> {
+    let msg = db::insert_message(ctx.conn, me, Some(gid), body, &ctx.now_s)?;
+    let mut count = 0;
+    let mut visible = 0;
+    let agents = db::group_member_ids(ctx.conn, gid)?
+        .into_iter()
+        .map(|id| (Kind::Agent, id));
+    let humans = db::human_ids(ctx.conn)?
+        .into_iter()
+        .map(|id| (Kind::Human, id));
+    for (kind, id) in agents.chain(humans) {
+        if kind == me.kind && id == me.id {
+            continue;
+        }
+        db::insert_delivery(ctx.conn, msg, kind, id)?;
+        count += 1;
+        if me.kind == Kind::Human || kind == Kind::Agent {
+            visible += 1;
+        }
+    }
+    Ok((count, visible))
+}
+
 fn send(ctx: &Ctx, to: &str, body: Option<String>) -> Result<String> {
     let me = ctx.actor()?;
     let body = read_body(body)?;
@@ -436,26 +468,7 @@ fn send(ctx: &Ctx, to: &str, body: Option<String>) -> Result<String> {
         if me.kind == Kind::Agent && !db::is_member(ctx.conn, gid, me.id)? {
             bail!("you are not a member of @{group}");
         }
-        let msg = db::insert_message(ctx.conn, &me, Some(gid), &body, &ctx.now_s)?;
-        // Humans silently receive every broadcast; agents only see the agent count.
-        let mut count = 0;
-        let mut visible = 0;
-        let agents = db::group_member_ids(ctx.conn, gid)?
-            .into_iter()
-            .map(|id| (Kind::Agent, id));
-        let humans = db::human_ids(ctx.conn)?
-            .into_iter()
-            .map(|id| (Kind::Human, id));
-        for (kind, id) in agents.chain(humans) {
-            if kind == me.kind && id == me.id {
-                continue;
-            }
-            db::insert_delivery(ctx.conn, msg, kind, id)?;
-            count += 1;
-            if me.kind == Kind::Human || kind == Kind::Agent {
-                visible += 1;
-            }
-        }
+        let (count, visible) = broadcast(ctx, &me, gid, &body)?;
         tracing::info!(from = me.name, to = %format!("@{group}"), recipients = count, bytes = body.len(), "sent broadcast");
         return Ok(format!("Sent to @{group} ({visible} recipients).\n"));
     }
