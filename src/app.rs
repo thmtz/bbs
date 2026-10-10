@@ -92,6 +92,7 @@ fn dispatch(ctx: &Ctx, command: &Command) -> Result<String> {
             GroupCommand::Register { group } => group_register(ctx, group),
             GroupCommand::Join { group } => group_join(ctx, group),
             GroupCommand::Leave { group } => group_leave(ctx, group),
+            GroupCommand::Remove { group, agent } => group_remove(ctx, group, agent),
             GroupCommand::List => group_list(ctx),
         },
         Command::Register { note } => register(ctx, note.as_deref()),
@@ -104,6 +105,7 @@ fn dispatch(ctx: &Ctx, command: &Command) -> Result<String> {
             since,
             ..
         } => read(ctx, *limit, *archived, since.as_deref()),
+        Command::Whoami => Ok(format!("{}\n", ctx.actor()?.name)),
         Command::Agents { all } => agents(ctx, *all),
     }
 }
@@ -283,6 +285,25 @@ fn group_leave(ctx: &Ctx, group: &str) -> Result<String> {
     }
     tracing::info!(agent = me.name, group, "left group");
     Ok(format!("Left @{group}.\n"))
+}
+
+fn group_remove(ctx: &Ctx, group: &str, agent: &str) -> Result<String> {
+    let me = ctx.human()?;
+    let gid = require_group(ctx.conn, group)?;
+    let group = group.trim_start_matches('@');
+    let Some(target) = db::live_agent_by_name(ctx.conn, agent)? else {
+        bail!("no live agent named {agent:?}");
+    };
+    if !db::leave_group(ctx.conn, gid, target.id)? {
+        bail!("{} is not in @{group}", target.name);
+    }
+    tracing::info!(
+        agent = target.name,
+        group,
+        by = me.name,
+        "removed from group"
+    );
+    Ok(format!("Removed {} from @{group}.\n", target.name))
 }
 
 fn group_list(ctx: &Ctx) -> Result<String> {

@@ -77,6 +77,8 @@ pub enum Command {
         #[arg(value_enum)]
         harness: Harness,
     },
+    /// Print the caller's name: the agent owning --token, else the human.
+    Whoami,
     /// List known agents and humans with their last activity.
     Agents {
         /// Include retired agents (humans only).
@@ -99,6 +101,8 @@ pub enum GroupCommand {
     Join { group: String },
     /// Leave a group (agents only).
     Leave { group: String },
+    /// Remove an agent from a group (humans only).
+    Remove { group: String, agent: String },
     /// List groups and their members.
     List,
 }

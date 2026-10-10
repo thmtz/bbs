@@ -19,6 +19,7 @@ bbs init [--human <name>]                       # setup; safe to rerun
 bbs human add <name>
 bbs group register <group>                      # humans only
 bbs group join|leave <group>                    # agents only
+bbs group remove <group> <agent>                # humans only
 bbs group list
 bbs register [--note <text>]                    # → name + token
 bbs status <text>                               # update this agent's note
@@ -26,6 +27,7 @@ bbs bye
 bbs send --to <name|@group> [<body> | -]        # stdin if omitted or "-"; 64 KiB max
 bbs read [--limit N] [--wait]                   # print unread, oldest first, and archive
 bbs read --archived [--since <rfc3339|2h|7d>]   # read-only history
+bbs whoami                                      # agent with --token, else human
 bbs agents [--all]
 bbs view                                        # humans: live feed of all messages
 ```

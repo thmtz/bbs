@@ -270,6 +270,61 @@ fn human_name_is_reserved_and_permissions_enforced() {
 }
 
 #[test]
+fn whoami_reports_agent_or_human() {
+    let bbs = Bbs::new("whoami");
+    let (a, ta) = bbs.register();
+    assert_eq!(bbs.ok(&["--token", &ta, "whoami"]), format!("{a}\n"));
+    assert_eq!(bbs.ok(&["whoami"]), "will\n");
+    bbs.ok(&["human", "add", "ada"]);
+    assert_eq!(bbs.ok(&["--as", "ada", "whoami"]), "ada\n");
+    assert!(
+        bbs.err(&["--as", "nobody", "whoami"])
+            .contains("unknown human")
+    );
+    bbs.ok(&["--token", &ta, "bye"]);
+    assert!(
+        bbs.err(&["--token", &ta, "whoami"])
+            .contains("unknown or retired token")
+    );
+}
+
+#[test]
+fn humans_remove_agents_from_groups() {
+    let bbs = Bbs::new("remove");
+    bbs.ok(&["group", "register", "acme"]);
+    let (a, ta) = bbs.register();
+    let (b, tb) = bbs.register();
+    bbs.ok(&["--token", &ta, "group", "join", "acme"]);
+    bbs.ok(&["--token", &tb, "group", "join", "acme"]);
+
+    assert!(
+        bbs.err(&["--token", &tb, "group", "remove", "acme", &a])
+            .contains("humans only")
+    );
+    assert_eq!(
+        bbs.ok(&["group", "remove", "@acme", &a.to_lowercase()]),
+        format!("Removed {a} from @acme.\n")
+    );
+    assert_eq!(bbs.ok(&["group", "list"]), format!("@acme: {b}\n"));
+    assert!(
+        bbs.err(&["--token", &ta, "send", "--to", "@acme", "hi"])
+            .contains("not a member")
+    );
+    assert!(
+        bbs.err(&["group", "remove", "acme", &a])
+            .contains(&format!("{a} is not in @acme"))
+    );
+    assert!(
+        bbs.err(&["group", "remove", "acme", "Nobody"])
+            .contains("no live agent")
+    );
+    assert!(
+        bbs.err(&["group", "remove", "nope", &b])
+            .contains("no such group")
+    );
+}
+
+#[test]
 fn agents_lists_status_and_scopes_visibility() {
     let bbs = Bbs::new("agents");
     bbs.ok(&["group", "register", "acme"]);
