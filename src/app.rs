@@ -17,6 +17,8 @@ const RETIRE_AFTER_DAYS: i64 = 7;
 const MAX_BODY_BYTES: usize = 64 * 1024;
 const WAIT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const WAIT_TOUCH_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// `active_at` is refreshed at most this often.
+const ACTIVE_AT_DEBOUNCE: chrono::Duration = chrono::Duration::seconds(60);
 
 pub fn home_dir() -> Result<PathBuf> {
     std::env::var_os("HOME")
@@ -30,6 +32,11 @@ pub(crate) fn state_dir() -> Result<PathBuf> {
 
 pub(crate) fn fmt_time(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(SecondsFormat::Micros, true)
+}
+
+/// Cutoff for `db::touch_*`: only `active_at` values older than this are rewritten.
+pub(crate) fn touch_cutoff(now: DateTime<Utc>) -> String {
+    fmt_time(now - ACTIVE_AT_DEBOUNCE)
 }
 
 /// Stored timestamps are fixed-width; show them to second precision.
@@ -154,14 +161,14 @@ impl Ctx<'_> {
             let Some(agent) = db::agent_by_token(self.conn, &token)? else {
                 bail!("unknown or retired token; run `bbs register`");
             };
-            db::touch_agent(self.conn, agent.id, &self.now_s)?;
+            db::touch_agent(self.conn, agent.id, &self.now_s, &touch_cutoff(self.now))?;
             return Ok(agent);
         }
         let name = default_human(self.as_human)?;
         let Some(human) = db::find_human(self.conn, &name)? else {
             bail!("unknown human {name:?}; run `bbs init` or `bbs human add {name}`");
         };
-        db::touch_human(self.conn, human.id, &self.now_s)?;
+        db::touch_human(self.conn, human.id, &self.now_s, &touch_cutoff(self.now))?;
         Ok(human)
     }
 

@@ -149,10 +149,13 @@ pub fn insert_human(conn: &Connection, name: &str, now: &str) -> Result<i64> {
     Ok(conn.last_insert_rowid())
 }
 
-pub fn touch_human(conn: &Connection, id: i64, now: &str) -> Result<()> {
+/// Record activity, skipping the write unless `active_at` is older than
+/// `stale_before`. A no-op commit leaves `PRAGMA data_version` alone, so
+/// pollers only wake for real changes.
+pub fn touch_human(conn: &Connection, id: i64, now: &str, stale_before: &str) -> Result<()> {
     conn.execute(
-        "UPDATE humans SET active_at = ?1 WHERE id = ?2",
-        params![now, id],
+        "UPDATE humans SET active_at = ?1 WHERE id = ?2 AND active_at < ?3",
+        params![now, id, stale_before],
     )?;
     Ok(())
 }
@@ -235,10 +238,13 @@ pub fn token_exists(conn: &Connection, token: &str) -> Result<bool> {
     Ok(n > 0)
 }
 
-pub fn touch_agent(conn: &Connection, id: i64, now: &str) -> Result<()> {
+/// Record activity, skipping the write unless `active_at` is older than
+/// `stale_before`. A no-op commit leaves `PRAGMA data_version` alone, so
+/// pollers only wake for real changes.
+pub fn touch_agent(conn: &Connection, id: i64, now: &str, stale_before: &str) -> Result<()> {
     conn.execute(
-        "UPDATE agents SET active_at = ?1 WHERE id = ?2",
-        params![now, id],
+        "UPDATE agents SET active_at = ?1 WHERE id = ?2 AND active_at < ?3",
+        params![now, id, stale_before],
     )?;
     Ok(())
 }

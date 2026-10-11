@@ -390,6 +390,56 @@ fn hook(bbs: &Bbs, event: serde_json::Value) -> Option<serde_json::Value> {
 }
 
 #[test]
+fn active_at_writes_are_debounced() {
+    let bbs = Bbs::new("debounce");
+    let register_out = bbs.ok(&["register"]);
+    let (_, ta) = bbs.register();
+    let post_tool = |command: &str, stdout: &str| {
+        serde_json::json!({
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": command },
+            "tool_response": { "stdout": stdout },
+        })
+    };
+    hook(&bbs, post_tool("bbs register", &register_out));
+    bbs.ok(&["whoami"]);
+    bbs.ok(&["--token", &ta, "whoami"]);
+
+    // Freshly active callers do not write, so other connections see no change.
+    let db = bbs.db();
+    let version = || -> i64 {
+        db.pragma_query_value(None, "data_version", |r| r.get(0))
+            .unwrap()
+    };
+    let before = version();
+    bbs.ok(&["whoami"]);
+    bbs.ok(&["--token", &ta, "agents"]);
+    hook(&bbs, post_tool("ls", ""));
+    assert_eq!(version(), before);
+
+    // Stale timestamps are still refreshed.
+    db.execute_batch(
+        "UPDATE agents SET active_at = '2000-01-01T00:00:00.000000Z';
+         UPDATE humans SET active_at = '2000-01-01T00:00:00.000000Z';",
+    )
+    .unwrap();
+    bbs.ok(&["whoami"]);
+    bbs.ok(&["--token", &ta, "whoami"]);
+    hook(&bbs, post_tool("ls", ""));
+    let stale: i64 = db
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM agents WHERE active_at < '2001')
+                  + (SELECT COUNT(*) FROM humans WHERE active_at < '2001')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stale, 0);
+}
+
+#[test]
 fn claude_code_hooks_bind_and_deliver() {
     let bbs = Bbs::new("hook");
     bbs.ok(&["group", "register", "acme"]);

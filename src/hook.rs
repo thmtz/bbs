@@ -9,7 +9,7 @@ use chrono::Utc;
 use rusqlite::{Connection, TransactionBehavior};
 use serde_json::{Value, json};
 
-use crate::app::{fmt_time, format_messages, identity_line};
+use crate::app::{fmt_time, format_messages, identity_line, touch_cutoff};
 use crate::cli::Harness;
 use crate::db::{self, Kind};
 
@@ -45,7 +45,8 @@ fn handle_event(conn: &Connection, harness: &str, event: &Value) -> Result<Optio
         return Ok(None);
     };
     let name = event["hook_event_name"].as_str().unwrap_or_default();
-    let now = fmt_time(Utc::now());
+    let now_t = Utc::now();
+    let now = fmt_time(now_t);
 
     if name == "PostToolUse" {
         bind_on_register(conn, harness, session_id, event, &now)?;
@@ -56,7 +57,7 @@ fn handle_event(conn: &Connection, harness: &str, event: &Value) -> Result<Optio
 
     let additional_context = |text: String| json!({ "hookSpecificOutput": { "hookEventName": name, "additionalContext": text } });
     let deliver = |from_kind: Option<Kind>| -> Result<Option<String>> {
-        db::touch_agent(conn, me.id, &now)?;
+        db::touch_agent(conn, me.id, &now, &touch_cutoff(now_t))?;
         let msgs = db::take_unread(conn, &me, from_kind, None, &now)?;
         if msgs.is_empty() {
             return Ok(None);
