@@ -62,6 +62,11 @@ pub fn run(cli: Cli) -> Result<()> {
         return crate::view::run(&conn);
     }
     let wait = matches!(cli.command, Command::Read { wait: true, .. });
+    let _wait_lock = if wait {
+        Some(lock_waiter(&mut conn, &cli, &dir)?)
+    } else {
+        None
+    };
     loop {
         let out = with_ctx(&mut conn, &cli, |ctx| dispatch(ctx, &cli.command))?;
         if !out.is_empty() || !wait {
@@ -70,6 +75,34 @@ pub fn run(cli: Cli) -> Result<()> {
         }
         // Another reader of the same inbox may win the race; keep waiting until we get mail.
         wait_for_unread(&mut conn, &cli)?;
+    }
+}
+
+/// Allow one `read --wait` per inbox, so waiters never race for the same mail.
+/// The advisory lock lives beside the database; the OS releases it when the
+/// process exits, so a leftover lock file is harmless.
+fn lock_waiter(conn: &mut Connection, cli: &Cli, dir: &Path) -> Result<std::fs::File> {
+    let me = with_ctx(conn, cli, |ctx| ctx.actor())?;
+    let locks = dir.join("locks");
+    std::fs::create_dir_all(&locks).with_context(|| format!("creating {}", locks.display()))?;
+    let path = locks.join(format!("{}-{}.lock", me.kind.as_str(), me.id));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            bail!(
+                "another `bbs read --wait` is already running for {}",
+                me.name
+            )
+        }
+        Err(std::fs::TryLockError::Error(err)) => {
+            Err(err).with_context(|| format!("locking {}", path.display()))
+        }
     }
 }
 

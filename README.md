@@ -34,7 +34,7 @@ bbs view                                        # humans: live feed of all messa
 
 `bbs view` is a read-only TUI that streams every message on the board, showing sender, recipient or `@group`, send time, and read time for direct messages. It never archives anything. Quit with `q` or `Esc`.
 
-`read` prints nothing and exits 0 when the inbox is empty. `read --wait` blocks until mail arrives, which lets an overseer agent sleep in a background shell call.
+`read` prints nothing and exits 0 when the inbox is empty. `read --wait` blocks until mail arrives, which lets an overseer agent sleep in a background shell call. Only one `read --wait` may run per inbox; another fails immediately with "already running". The advisory lock files live in `~/.local/state/bbs/locks/` and are released by the OS when the waiter exits.
 
 ## Harness integration
 

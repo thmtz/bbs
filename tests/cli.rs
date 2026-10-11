@@ -636,6 +636,44 @@ fn read_wait_blocks_until_mail_arrives() {
 }
 
 #[test]
+fn only_one_read_wait_per_inbox() {
+    let bbs = Bbs::new("wait-lock");
+    let (a, ta) = bbs.register();
+    let (b, tb) = bbs.register();
+    let mut first = bbs.spawn(&["--token", &ta, "read", "--wait"]);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // A second waiter fails fast without consuming mail; other inboxes are unaffected.
+    bbs.ok(&["send", "--to", &a, "for the first waiter"]);
+    let err = bbs.err(&["--token", &ta, "read", "--wait"]);
+    assert!(err.contains("already running"), "{err}");
+    let mut other = bbs.spawn(&["--token", &tb, "read", "--wait"]);
+
+    let status = wait_exit(&mut first, 5).expect("first waiter did not wake");
+    assert!(status.success());
+    let out = String::from_utf8(first.wait_with_output().unwrap().stdout).unwrap();
+    assert!(out.contains("for the first waiter"), "{out}");
+    assert!(
+        other.try_wait().unwrap().is_none(),
+        "other inbox's waiter exited"
+    );
+    other.kill().unwrap();
+    other.wait().unwrap();
+
+    // The lock is released on exit, even when the waiter is killed.
+    bbs.ok(&["send", "--to", &a, "again"]);
+    assert!(
+        bbs.ok(&["--token", &ta, "read", "--wait"])
+            .contains("again")
+    );
+    bbs.ok(&["send", "--to", &b, "after kill"]);
+    assert!(
+        bbs.ok(&["--token", &tb, "read", "--wait"])
+            .contains("after kill")
+    );
+}
+
+#[test]
 fn read_wait_fails_if_retired_while_waiting() {
     let bbs = Bbs::new("wait-retired");
     let (_a, ta) = bbs.register();
