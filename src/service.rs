@@ -20,7 +20,7 @@ pub const MAX_BODY_BYTES: usize = 64 * 1024;
 const ACTIVE_AT_DEBOUNCE: chrono::Duration = chrono::Duration::seconds(60);
 
 /// Who is calling: the agent owning `token`, else the human named `human`.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Caller {
     pub token: Option<String>,
     pub human: Option<String>,
