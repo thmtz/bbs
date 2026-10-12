@@ -5,34 +5,33 @@ use std::io::Read as _;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
 use serde_json::{Value, json};
 
 use crate::app::{format_messages, identity_line};
+use crate::backend::Backend;
 use crate::cli::Harness;
 use crate::config::Config;
-use crate::db;
 use crate::proto;
-use crate::service::{self, Caller};
+use crate::service::Caller;
 
-pub fn run(harness: Harness, db_path: &Path) -> Result<()> {
-    if let Err(err) = handle(harness, db_path) {
+pub async fn run(harness: Harness, dir: &Path) -> Result<()> {
+    if let Err(err) = handle(harness, dir).await {
         tracing::error!(harness = harness.as_str(), "hook failed: {err:#}");
     }
     Ok(())
 }
 
-fn handle(harness: Harness, db_path: &Path) -> Result<()> {
+async fn handle(harness: Harness, dir: &Path) -> Result<()> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
-    // Hooks over a server arrive with the remote backend; until then, stay silent.
-    if Config::load()?.server.is_some() || !db_path.exists() {
+    let config = Config::load()?;
+    if config.server.is_none() && !dir.join("bbs.db").exists() {
         return Ok(());
     }
     let event: Value = serde_json::from_str(&input).context("parsing hook input")?;
-    let mut conn = db::open(db_path)?;
-    db::migrate(&mut conn)?;
-    if let Some(output) = handle_event(&mut conn, harness.as_str(), &event)? {
+    // A down server fails within the connect timeout, so it never stalls the harness.
+    let mut backend = Backend::open(&config, dir, Caller::default()).await?;
+    if let Some(output) = handle_event(&mut backend, harness.as_str(), &event).await? {
         println!("{output}");
     }
     Ok(())
@@ -40,55 +39,40 @@ fn handle(harness: Harness, db_path: &Path) -> Result<()> {
 
 /// Claude Code and Codex share a hook protocol: the same event names, `Bash`
 /// tool events, `additionalContext` injection, and `decision: block` on Stop.
-fn handle_event(conn: &mut Connection, harness: &str, event: &Value) -> Result<Option<Value>> {
+async fn handle_event(
+    backend: &mut Backend,
+    harness: &str,
+    event: &Value,
+) -> Result<Option<Value>> {
     let Some(session_id) = event["session_id"].as_str() else {
         return Ok(None);
     };
     let name = event["hook_event_name"].as_str().unwrap_or_default();
 
     if name == "PostToolUse" {
-        bind_on_register(conn, harness, session_id, event)?;
+        bind_on_register(backend, harness, session_id, event).await?;
     }
     let req = proto::SessionAgentRequest {
         harness: harness.to_string(),
         session_id: session_id.to_string(),
     };
-    let bound = service::session_agent(conn, req)?;
+    let bound = backend.session_agent(req).await?;
     let Some(me) = bound.agent else {
         return Ok(None);
     };
-    let caller = Caller {
+    backend.set_caller(Caller {
         token: Some(bound.token.clone()),
         human: None,
-    };
+    });
 
     let additional_context = |text: String| json!({ "hookSpecificOutput": { "hookEventName": name, "additionalContext": text } });
-    let mut deliver = |from_kind: Option<proto::Kind>| -> Result<Option<String>> {
-        let req = proto::ReadRequest {
-            from_kind: from_kind.map(Into::into),
-            ..Default::default()
-        };
-        let msgs = service::read(conn, &caller, req)?.messages;
-        if msgs.is_empty() {
-            return Ok(None);
-        }
-        tracing::info!(
-            reader = me.name,
-            count = msgs.len(),
-            event = name,
-            "delivered via hook"
-        );
-        Ok(Some(format!(
-            "New BBS messages for {}:\n\n{}",
-            me.name,
-            format_messages(&msgs)?
-        )))
-    };
-
     Ok(match name {
-        "PostToolUse" | "UserPromptSubmit" => deliver(None)?.map(additional_context),
+        "PostToolUse" | "UserPromptSubmit" => deliver(backend, &me.name, name, None)
+            .await?
+            .map(additional_context),
         // Only humans may keep an agent from stopping; agent chatter waits for the next turn.
-        "Stop" => deliver(Some(proto::Kind::Human))?
+        "Stop" => deliver(backend, &me.name, name, Some(proto::Kind::Human))
+            .await?
             .map(|reason| json!({ "decision": "block", "reason": reason })),
         "SessionStart" if event["source"].as_str() == Some("compact") => {
             Some(additional_context(format!(
@@ -100,9 +84,31 @@ fn handle_event(conn: &mut Connection, harness: &str, event: &Value) -> Result<O
     })
 }
 
+/// Take the agent's unread mail (optionally only from `from_kind`) as hook text.
+async fn deliver(
+    backend: &mut Backend,
+    reader: &str,
+    event: &str,
+    from_kind: Option<proto::Kind>,
+) -> Result<Option<String>> {
+    let req = proto::ReadRequest {
+        from_kind: from_kind.map(Into::into),
+        ..Default::default()
+    };
+    let msgs = backend.read(req).await?.messages;
+    if msgs.is_empty() {
+        return Ok(None);
+    }
+    tracing::info!(reader, count = msgs.len(), event, "delivered via hook");
+    Ok(Some(format!(
+        "New BBS messages for {reader}:\n\n{}",
+        format_messages(&msgs)?
+    )))
+}
+
 /// When the session runs `bbs register`, bind the session to the new agent.
-fn bind_on_register(
-    conn: &mut Connection,
+async fn bind_on_register(
+    backend: &mut Backend,
     harness: &str,
     session_id: &str,
     event: &Value,
@@ -128,7 +134,7 @@ fn bind_on_register(
         session_id: session_id.to_string(),
         token,
     };
-    service::bind_session(conn, req)?;
+    backend.bind_session(req).await?;
     Ok(())
 }
 
