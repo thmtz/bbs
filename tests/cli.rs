@@ -17,10 +17,16 @@ impl Bbs {
     }
 
     fn run_with_stdin(&self, args: &[&str], stdin: &str) -> Output {
+        self.run_with_env(args, stdin, &[])
+    }
+
+    fn run_with_env(&self, args: &[&str], stdin: &str, env: &[(&str, &str)]) -> Output {
         let mut child = Command::new(env!("CARGO_BIN_EXE_bbs"))
             .args(args)
             .env("HOME", &self.home)
             .env("USER", "will")
+            .env_remove("BBS_SERVER")
+            .envs(env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -89,6 +95,7 @@ fn requires_init() {
     let out = Command::new(env!("CARGO_BIN_EXE_bbs"))
         .args(["read"])
         .env("HOME", &home)
+        .env_remove("BBS_SERVER")
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -112,6 +119,68 @@ fn init_is_idempotent() {
     assert_eq!(humans, 1);
     assert!(bbs.ok(&["group", "list"]).contains("acme"));
     bbs.ok(&["--token", &token, "group", "join", "acme"]);
+}
+
+fn config_path(bbs: &Bbs) -> PathBuf {
+    bbs.home.join(".config/bbs/config.toml")
+}
+
+#[test]
+fn init_writes_and_merges_config() {
+    let bbs = Bbs::new("config");
+    assert!(!config_path(&bbs).exists(), "plain init writes no config");
+    // Bind a session that has human mail waiting, so a Stop hook would block.
+    let register_out = bbs.ok(&["register"]);
+    let name = register_out.split('"').nth(1).unwrap();
+    hook(
+        &bbs,
+        serde_json::json!({
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": "bbs register" },
+            "tool_response": { "stdout": register_out, "stderr": "" },
+        }),
+    );
+    bbs.ok(&["send", "--to", name, "hello"]);
+
+    let out = bbs.ok(&["init", "--server", "bbs.example:7777"]);
+    assert_eq!(out, "BBS configured for server bbs.example:7777\n");
+    bbs.ok(&["init", "--human", "ada"]);
+    let config = std::fs::read_to_string(config_path(&bbs)).unwrap();
+    assert!(config.contains("server = \"bbs.example:7777\""), "{config}");
+    assert!(config.contains("human = \"ada\""), "{config}");
+
+    // With a server configured, commands refuse and hooks stay silent.
+    assert!(
+        bbs.err(&["whoami"])
+            .contains("remote mode is not implemented yet")
+    );
+    let stop = serde_json::json!({"session_id": "s1", "hook_event_name": "Stop"});
+    assert_eq!(hook(&bbs, stop.clone()), None);
+    std::fs::remove_file(config_path(&bbs)).unwrap();
+    assert_eq!(hook(&bbs, stop).unwrap()["decision"], "block");
+}
+
+#[test]
+fn human_name_comes_from_as_then_config_then_user() {
+    let bbs = Bbs::new("human-config");
+    // Local init with --human saves the name and reserves it.
+    let out = bbs.ok(&["init", "--human", "ada"]);
+    assert!(out.contains("Human: ada"), "{out}");
+    assert_eq!(bbs.ok(&["whoami"]), "ada\n");
+    assert_eq!(bbs.ok(&["--as", "will", "whoami"]), "will\n");
+    std::fs::remove_file(config_path(&bbs)).unwrap();
+    assert_eq!(bbs.ok(&["whoami"]), "will\n");
+}
+
+#[test]
+fn bbs_server_env_overrides_config() {
+    let bbs = Bbs::new("server-env");
+    let out = bbs.run_with_env(&["whoami"], "", &[("BBS_SERVER", "127.0.0.1:1")]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("remote mode is not implemented yet"));
+    assert!(!config_path(&bbs).exists());
 }
 
 #[test]
@@ -572,6 +641,7 @@ impl Bbs {
             .args(args)
             .env("HOME", &self.home)
             .env("USER", "will")
+            .env_remove("BBS_SERVER")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -708,6 +778,7 @@ fn old_schema_is_migrated_on_open_even_concurrently() {
                 .arg("agents")
                 .env("HOME", &home)
                 .env("USER", "will")
+                .env_remove("BBS_SERVER")
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
                 .spawn()

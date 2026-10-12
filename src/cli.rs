@@ -11,7 +11,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub token: Option<String>,
 
-    /// Act as this human (default: $USER). Ignored for agents.
+    /// Act as this human (default: config `human`, then $USER). Ignored for agents.
     #[arg(long = "as", global = true, value_name = "HUMAN")]
     pub as_human: Option<String>,
 
@@ -21,9 +21,13 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Create the BBS state directory, migrate the database, and reserve the human name.
+    /// Write ~/.config/bbs/config.toml; in local mode, also create and migrate the
+    /// database and reserve the human name.
     Init {
-        /// Human name to reserve (default: $USER).
+        /// Use the `bbs serve` process at this host:port.
+        #[arg(long, value_name = "ADDR")]
+        server: Option<String>,
+        /// Human name to save and reserve (default: --as, config `human`, then $USER).
         #[arg(long)]
         human: Option<String>,
     },
