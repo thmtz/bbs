@@ -60,6 +60,10 @@ pub struct MessageView {
     pub from_kind: Kind,
     pub from_name: String,
     pub to_group: Option<String>,
+    /// Feed only: recipient of a direct message.
+    pub to_name: Option<String>,
+    /// Feed only: when a direct message was read; always `None` for broadcasts.
+    pub read_at: Option<String>,
     pub body: String,
 }
 
@@ -504,6 +508,8 @@ fn message_view(r: &rusqlite::Row) -> rusqlite::Result<MessageView> {
         },
         from_name: r.get(3)?,
         to_group: r.get(4)?,
+        to_name: None,
+        read_at: None,
         body: r.get(5)?,
     })
 }
@@ -611,24 +617,11 @@ pub fn session_agent(
 
 // ---- feed (bbs view) -------------------------------------------------------
 
-#[derive(Debug, Clone)]
-pub struct FeedRow {
-    pub created_at: String,
-    pub from_kind: Kind,
-    pub from_name: String,
-    pub to_group: Option<String>,
-    /// Recipient of a direct message; `None` for broadcasts.
-    pub to_name: Option<String>,
-    /// When a direct message was read; always `None` for broadcasts.
-    pub read_at: Option<String>,
-    pub body: String,
-}
-
 /// The most recent `limit` messages across the whole board, oldest first. Each
 /// broadcast appears once, regardless of how many deliveries it fanned out to.
-pub fn recent_messages(conn: &Connection, limit: u32) -> Result<Vec<FeedRow>> {
+pub fn recent_messages(conn: &Connection, limit: u32) -> Result<Vec<MessageView>> {
     let mut stmt = conn.prepare(
-        "SELECT m.created_at, m.from_kind, COALESCE(fa.name, fh.name), g.name,
+        "SELECT m.id, m.created_at, m.from_kind, COALESCE(fa.name, fh.name), g.name,
                 COALESCE(ta.name, th.name), d.archived_at, m.body
          FROM messages m
          LEFT JOIN agents fa ON m.from_kind = 'agent' AND fa.id = m.from_id
@@ -640,21 +633,22 @@ pub fn recent_messages(conn: &Connection, limit: u32) -> Result<Vec<FeedRow>> {
          ORDER BY m.id DESC
          LIMIT ?1",
     )?;
-    let mut rows: Vec<FeedRow> = stmt
+    let mut rows: Vec<MessageView> = stmt
         .query_map(params![limit], |r| {
-            let from_kind: String = r.get(1)?;
-            Ok(FeedRow {
-                created_at: r.get(0)?,
+            let from_kind: String = r.get(2)?;
+            Ok(MessageView {
+                id: r.get(0)?,
+                created_at: r.get(1)?,
                 from_kind: if from_kind == "human" {
                     Kind::Human
                 } else {
                     Kind::Agent
                 },
-                from_name: r.get(2)?,
-                to_group: r.get(3)?,
-                to_name: r.get(4)?,
-                read_at: r.get(5)?,
-                body: r.get(6)?,
+                from_name: r.get(3)?,
+                to_group: r.get(4)?,
+                to_name: r.get(5)?,
+                read_at: r.get(6)?,
+                body: r.get(7)?,
             })
         })?
         .collect::<Result<_, _>>()?;

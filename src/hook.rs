@@ -5,13 +5,14 @@ use std::io::Read as _;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use chrono::Utc;
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::Connection;
 use serde_json::{Value, json};
 
-use crate::app::{fmt_time, format_messages, identity_line, touch_cutoff};
+use crate::app::{format_messages, identity_line};
 use crate::cli::Harness;
-use crate::db::{self, Kind};
+use crate::db;
+use crate::proto;
+use crate::service::{self, Caller};
 
 pub fn run(harness: Harness, db_path: &Path) -> Result<()> {
     if let Err(err) = handle(harness, db_path) {
@@ -29,10 +30,7 @@ fn handle(harness: Harness, db_path: &Path) -> Result<()> {
     let event: Value = serde_json::from_str(&input).context("parsing hook input")?;
     let mut conn = db::open(db_path)?;
     db::migrate(&mut conn)?;
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let output = handle_event(&tx, harness.as_str(), &event)?;
-    tx.commit()?;
-    if let Some(output) = output {
+    if let Some(output) = handle_event(&mut conn, harness.as_str(), &event)? {
         println!("{output}");
     }
     Ok(())
@@ -40,25 +38,35 @@ fn handle(harness: Harness, db_path: &Path) -> Result<()> {
 
 /// Claude Code and Codex share a hook protocol: the same event names, `Bash`
 /// tool events, `additionalContext` injection, and `decision: block` on Stop.
-fn handle_event(conn: &Connection, harness: &str, event: &Value) -> Result<Option<Value>> {
+fn handle_event(conn: &mut Connection, harness: &str, event: &Value) -> Result<Option<Value>> {
     let Some(session_id) = event["session_id"].as_str() else {
         return Ok(None);
     };
     let name = event["hook_event_name"].as_str().unwrap_or_default();
-    let now_t = Utc::now();
-    let now = fmt_time(now_t);
 
     if name == "PostToolUse" {
-        bind_on_register(conn, harness, session_id, event, &now)?;
+        bind_on_register(conn, harness, session_id, event)?;
     }
-    let Some((me, token)) = db::session_agent(conn, harness, session_id)? else {
+    let req = proto::SessionAgentRequest {
+        harness: harness.to_string(),
+        session_id: session_id.to_string(),
+    };
+    let bound = service::session_agent(conn, req)?;
+    let Some(me) = bound.agent else {
         return Ok(None);
+    };
+    let caller = Caller {
+        token: Some(bound.token.clone()),
+        human: None,
     };
 
     let additional_context = |text: String| json!({ "hookSpecificOutput": { "hookEventName": name, "additionalContext": text } });
-    let deliver = |from_kind: Option<Kind>| -> Result<Option<String>> {
-        db::touch_agent(conn, me.id, &now, &touch_cutoff(now_t))?;
-        let msgs = db::take_unread(conn, &me, from_kind, None, &now)?;
+    let mut deliver = |from_kind: Option<proto::Kind>| -> Result<Option<String>> {
+        let req = proto::ReadRequest {
+            from_kind: from_kind.map(Into::into),
+            ..Default::default()
+        };
+        let msgs = service::read(conn, &caller, req)?.messages;
         if msgs.is_empty() {
             return Ok(None);
         }
@@ -71,19 +79,19 @@ fn handle_event(conn: &Connection, harness: &str, event: &Value) -> Result<Optio
         Ok(Some(format!(
             "New BBS messages for {}:\n\n{}",
             me.name,
-            format_messages(&me, &msgs)?
+            format_messages(&msgs)?
         )))
     };
 
     Ok(match name {
         "PostToolUse" | "UserPromptSubmit" => deliver(None)?.map(additional_context),
         // Only humans may keep an agent from stopping; agent chatter waits for the next turn.
-        "Stop" => deliver(Some(Kind::Human))?
+        "Stop" => deliver(Some(proto::Kind::Human))?
             .map(|reason| json!({ "decision": "block", "reason": reason })),
         "SessionStart" if event["source"].as_str() == Some("compact") => {
             Some(additional_context(format!(
                 "You are registered on the BBS. {}",
-                identity_line(&me.name, &token)
+                identity_line(&me.name, &bound.token)
             )))
         }
         _ => None,
@@ -92,11 +100,10 @@ fn handle_event(conn: &Connection, harness: &str, event: &Value) -> Result<Optio
 
 /// When the session runs `bbs register`, bind the session to the new agent.
 fn bind_on_register(
-    conn: &Connection,
+    conn: &mut Connection,
     harness: &str,
     session_id: &str,
     event: &Value,
-    now: &str,
 ) -> Result<()> {
     if event["tool_name"].as_str() != Some("Bash") {
         return Ok(());
@@ -114,15 +121,12 @@ fn bind_on_register(
     let Some(token) = parse_welcome_token(stdout) else {
         return Ok(());
     };
-    let Some(agent) = db::agent_by_token(conn, &token)? else {
-        return Ok(());
+    let req = proto::BindSessionRequest {
+        harness: harness.to_string(),
+        session_id: session_id.to_string(),
+        token,
     };
-    if let Some(previous) = db::bind_session(conn, harness, session_id, agent.id, now)? {
-        // A session holds one identity; re-registering retires the old one.
-        db::retire_agent(conn, previous, now)?;
-        tracing::info!(agent_id = previous, "retired agent replaced in session");
-    }
-    tracing::info!(harness, session_id, agent = agent.name, "bound session");
+    service::bind_session(conn, req)?;
     Ok(())
 }
 

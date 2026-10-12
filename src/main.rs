@@ -4,6 +4,7 @@ mod db;
 mod hook;
 mod names;
 mod proto;
+mod service;
 mod view;
 
 use std::fs::OpenOptions;

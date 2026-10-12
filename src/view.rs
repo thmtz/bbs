@@ -13,21 +13,34 @@ use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use rusqlite::Connection;
 
-use crate::db::{self, FeedRow, Kind};
+use crate::db;
+use crate::proto::{FeedRequest, Kind, Message};
+use crate::service::{self, Caller};
 
 const BACKLOG: u32 = 200;
 const DB_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const KEY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-pub fn run(conn: &Connection) -> Result<()> {
+pub fn run(conn: &mut Connection, caller: &Caller) -> Result<()> {
+    // Fetch before taking over the terminal, so a refusal prints normally.
+    let rows = feed(conn, caller)?;
     let mut terminal = ratatui::init();
-    let result = feed_loop(&mut terminal, conn);
+    let result = feed_loop(&mut terminal, conn, caller, rows);
     ratatui::restore();
     result
 }
 
-fn feed_loop(terminal: &mut DefaultTerminal, conn: &Connection) -> Result<()> {
-    let mut rows = db::recent_messages(conn, BACKLOG)?;
+fn feed(conn: &mut Connection, caller: &Caller) -> Result<Vec<Message>> {
+    let req = FeedRequest { backlog: BACKLOG };
+    Ok(service::feed(conn, caller, req)?.messages)
+}
+
+fn feed_loop(
+    terminal: &mut DefaultTerminal,
+    conn: &mut Connection,
+    caller: &Caller,
+    mut rows: Vec<Message>,
+) -> Result<()> {
     let mut seen_version = db::data_version(conn)?;
     let mut last_poll = Instant::now();
     let mut dirty = true;
@@ -56,14 +69,14 @@ fn feed_loop(terminal: &mut DefaultTerminal, conn: &Connection) -> Result<()> {
             let version = db::data_version(conn)?;
             if version != seen_version {
                 seen_version = version;
-                rows = db::recent_messages(conn, BACKLOG)?;
+                rows = feed(conn, caller)?;
                 dirty = true;
             }
         }
     }
 }
 
-fn render(frame: &mut Frame, rows: &[FeedRow]) {
+fn render(frame: &mut Frame, rows: &[Message]) {
     let [title_area, feed_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(frame.area());
 
@@ -99,7 +112,7 @@ fn render(frame: &mut Frame, rows: &[FeedRow]) {
     frame.render_widget(feed, feed_area);
 }
 
-fn header(row: &FeedRow) -> Line<'static> {
+fn header(row: &Message) -> Line<'static> {
     let sent = local(&row.created_at);
     let mut spans = vec![
         Span::styled(
@@ -110,7 +123,7 @@ fn header(row: &FeedRow) -> Line<'static> {
             Style::new().fg(Color::DarkGray),
         ),
         Span::raw("  "),
-        name_span(&row.from_name, row.from_kind),
+        name_span(&row.from_name, row.from_kind()),
         Span::styled(" → ", Style::new().fg(Color::DarkGray)),
     ];
     match (&row.to_group, &row.to_name) {
@@ -148,7 +161,7 @@ fn header(row: &FeedRow) -> Line<'static> {
 fn name_span(name: &str, kind: Kind) -> Span<'static> {
     let color = match kind {
         Kind::Human => Color::Magenta,
-        Kind::Agent => Color::Cyan,
+        Kind::Agent | Kind::Unspecified => Color::Cyan,
     };
     Span::styled(
         name.to_string(),
@@ -168,10 +181,11 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    fn row(group: Option<&str>, to: Option<&str>, read_at: Option<&str>, body: &str) -> FeedRow {
-        FeedRow {
+    fn row(group: Option<&str>, to: Option<&str>, read_at: Option<&str>, body: &str) -> Message {
+        Message {
+            id: 0,
             created_at: "2026-10-09T14:02:11.000000Z".into(),
-            from_kind: Kind::Agent,
+            from_kind: Kind::Agent.into(),
             from_name: "Juliana".into(),
             to_group: group.map(Into::into),
             to_name: to.map(Into::into),
@@ -180,7 +194,7 @@ mod tests {
         }
     }
 
-    fn screen(rows: &[FeedRow], height: u16) -> String {
+    fn screen(rows: &[Message], height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(70, height)).unwrap();
         terminal.draw(|f| render(f, rows)).unwrap();
         let buffer = terminal.backend().buffer();
