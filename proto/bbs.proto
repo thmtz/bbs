@@ -1,0 +1,123 @@
+syntax = "proto3";
+package bbs.v1;
+
+// Caller identity travels in gRPC metadata, never in messages:
+//   bbs-token: <agent token>   for agents
+//   bbs-human: <human name>    for humans
+// RPCs marked "no caller" ignore metadata.
+
+service Bbs {
+  // Create a human if missing. No caller. Used by `bbs init`.
+  rpc EnsureHuman(EnsureHumanRequest) returns (EnsureHumanResponse);
+  // Add a human; fails if the name is taken. Humans only.
+  rpc AddHuman(AddHumanRequest) returns (Empty);
+  // Register a new agent. Fails if the caller already has a token.
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc Whoami(Empty) returns (Principal);
+  rpc SetStatus(SetStatusRequest) returns (Empty);
+  rpc Bye(Empty) returns (ByeResponse);
+
+  rpc GroupRegister(GroupRequest) returns (GroupResponse);
+  rpc GroupJoin(GroupRequest) returns (GroupJoinResponse);
+  rpc GroupLeave(GroupRequest) returns (GroupResponse);
+  rpc GroupRemove(GroupRemoveRequest) returns (GroupRemoveResponse);
+  rpc GroupList(Empty) returns (GroupListResponse);
+
+  rpc Send(SendRequest) returns (SendResponse);
+  // Unread mail oldest first, archived as returned; or archived history.
+  rpc Read(ReadRequest) returns (ReadResponse);
+  // Block until unread mail exists, take it as Read would, stream it, end.
+  // One waiter per inbox; a second fails immediately with "already running".
+  rpc WaitForMail(WaitRequest) returns (stream Message);
+  rpc ListAgents(ListAgentsRequest) returns (ListAgentsResponse);
+  // Humans only. Emits the recent window at start and after every change.
+  rpc WatchFeed(FeedRequest) returns (stream FeedSnapshot);
+
+  // Harness session binding (hooks). No caller; the token is in the request.
+  rpc BindSession(BindSessionRequest) returns (BindSessionResponse);
+  rpc SessionAgent(SessionAgentRequest) returns (SessionAgentResponse);
+}
+
+message Empty {}
+
+enum Kind {
+  KIND_UNSPECIFIED = 0;
+  KIND_AGENT = 1;
+  KIND_HUMAN = 2;
+}
+
+message Principal {
+  Kind kind = 1;
+  int64 id = 2;
+  string name = 3;
+}
+
+message EnsureHumanRequest { string name = 1; }
+message EnsureHumanResponse { bool created = 1; }
+message AddHumanRequest { string name = 1; }
+
+message RegisterRequest {
+  optional string note = 1;
+  string pwd = 2;       // caller's working directory
+  string hostname = 3;  // caller's host
+}
+message RegisterResponse { string name = 1; string token = 2; }
+
+message SetStatusRequest { string text = 1; }
+message ByeResponse { string name = 1; }
+
+message GroupRequest { string group = 1; }   // with or without leading '@'
+message GroupResponse { string group = 1; }  // canonical name, no '@'
+message GroupJoinResponse { string group = 1; bool joined = 2; }  // joined=false: already a member
+message GroupRemoveRequest { string group = 1; string agent = 2; }
+message GroupRemoveResponse { string group = 1; string agent = 2; }  // canonical names
+message GroupListResponse { repeated Group groups = 1; }
+message Group { string name = 1; repeated string members = 2; }
+
+message SendRequest { string to = 1; string body = 2; }
+message SendResponse {
+  string to = 1;                   // canonical recipient: "Juliana" or "@acme"
+  optional uint32 recipients = 2;  // broadcasts only: recipients visible to the caller
+}
+
+message ReadRequest {
+  optional uint32 limit = 1;
+  bool archived = 2;
+  optional string since = 3;    // RFC3339 UTC; with archived only
+  optional Kind from_kind = 4;  // hooks: only mail from humans on Stop
+}
+message ReadResponse { repeated Message messages = 1; }
+
+message Message {
+  int64 id = 1;
+  string created_at = 2;
+  Kind from_kind = 3;
+  string from_name = 4;
+  optional string to_group = 5;  // broadcast target
+  optional string to_name = 6;   // direct recipient
+  optional string read_at = 7;   // feed only: when a direct message was read
+  string body = 8;
+}
+
+message WaitRequest { optional uint32 limit = 1; }
+
+message ListAgentsRequest { bool all = 1; }
+message ListAgentsResponse { repeated Human humans = 1; repeated Agent agents = 2; }
+message Human { string name = 1; string active_at = 2; }
+message Agent {
+  string name = 1;
+  optional string status = 2;
+  string pwd = 3;
+  string hostname = 4;
+  string active_at = 5;
+  bool retired = 6;
+  repeated string groups = 7;
+}
+
+message FeedRequest { uint32 backlog = 1; }
+message FeedSnapshot { repeated Message messages = 1; }
+
+message BindSessionRequest { string harness = 1; string session_id = 2; string token = 3; }
+message BindSessionResponse { Principal agent = 1; }
+message SessionAgentRequest { string harness = 1; string session_id = 2; }
+message SessionAgentResponse { Principal agent = 1; string token = 2; }  // both unset if unbound
