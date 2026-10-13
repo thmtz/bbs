@@ -1,7 +1,7 @@
 //! `bbs view`: a read-only, auto-following feed of every message on the board.
 //! It never archives anything, so watching does not consume anyone's mail.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Local};
@@ -12,36 +12,42 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::backend::Backend;
+use crate::backend::{Backend, FeedWatch};
 use crate::proto::{Kind, Message};
 
 const BACKLOG: u32 = 200;
-const DB_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const KEY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 pub async fn run(backend: &mut Backend) -> Result<()> {
+    let mut feed = backend.watch_feed(BACKLOG).await?;
     // Fetch before taking over the terminal, so a refusal prints normally.
-    let rows = backend.feed(BACKLOG).await?;
+    let rows = feed.next().await?;
     let mut terminal = ratatui::init();
-    let result = feed_loop(&mut terminal, backend, rows).await;
+    let result = feed_loop(&mut terminal, &mut feed, rows).await;
     ratatui::restore();
     result
 }
 
 async fn feed_loop(
     terminal: &mut DefaultTerminal,
-    backend: &mut Backend,
+    feed: &mut FeedWatch<'_>,
     mut rows: Vec<Message>,
 ) -> Result<()> {
-    let mut seen_version = backend.change_marker()?;
-    let mut last_poll = Instant::now();
     let mut dirty = true;
     loop {
         if dirty {
             terminal.draw(|frame| render(frame, &rows))?;
             dirty = false;
         }
-        if event::poll(KEY_POLL_INTERVAL)? {
+        // Wait for the next snapshot, checking keys at least every KEY_POLL_INTERVAL.
+        tokio::select! {
+            snapshot = feed.next() => {
+                rows = snapshot?;
+                dirty = true;
+            }
+            _ = tokio::time::sleep(KEY_POLL_INTERVAL) => {}
+        }
+        while event::poll(Duration::ZERO)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     let ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL)
@@ -52,19 +58,6 @@ async fn feed_loop(
                 }
                 Event::Resize(..) => dirty = true,
                 _ => {}
-            }
-        }
-        // Locally, data_version changes only when another connection commits,
-        // so the feed is re-queried only after new messages or reads. A server
-        // gives no marker, so its feed is re-fetched every poll.
-        if last_poll.elapsed() >= DB_POLL_INTERVAL {
-            last_poll = Instant::now();
-            let version = backend.change_marker()?;
-            if version.is_none() || version != seen_version {
-                seen_version = version;
-                let fresh = backend.feed(BACKLOG).await?;
-                dirty |= fresh != rows;
-                rows = fresh;
             }
         }
     }
