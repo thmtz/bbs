@@ -169,6 +169,13 @@ impl Backend {
         }
     }
 
+    pub async fn retire(&mut self, req: proto::RetireRequest) -> Result<proto::ByeResponse> {
+        match self {
+            Backend::Local(l) => service::retire_agent(&mut l.conn, &l.caller, req),
+            Backend::Remote(r) => rpc!(r, retire, req),
+        }
+    }
+
     pub async fn group_register(
         &mut self,
         req: proto::GroupRequest,

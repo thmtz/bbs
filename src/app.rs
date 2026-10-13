@@ -115,6 +115,10 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
             "Status updated.\n".to_string()
         }
         Command::Bye => format!("Goodbye, {}.\n", backend.bye().await?.name),
+        Command::Retire { agent } => {
+            let r = backend.retire(proto::RetireRequest { agent }).await?;
+            format!("Retired {}.\n", r.name)
+        }
         Command::Send { to, body } => {
             let req = proto::SendRequest {
                 to,

@@ -303,19 +303,37 @@ pub fn set_status(
 pub fn bye(conn: &mut Connection, caller: &Caller) -> Result<proto::ByeResponse> {
     with_ctx(conn, caller, |ctx| {
         let me = ctx.agent()?;
-        // Announce before retiring: retirement drops the memberships.
-        for (gid, group) in db::member_groups(ctx.conn, me.id)? {
-            broadcast(
-                ctx,
-                &me,
-                gid,
-                &format!("{} retired and left @{group}.", me.name),
-            )?;
-        }
-        db::retire_agent(ctx.conn, me.id, &ctx.now_s)?;
-        tracing::info!(agent = me.name, "agent retired");
+        retire(ctx, &me, &me, &format!("{} retired", me.name))?;
         Ok(proto::ByeResponse { name: me.name })
     })
+}
+
+pub fn retire_agent(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::RetireRequest,
+) -> Result<proto::ByeResponse> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.human()?;
+        let Some(target) = db::live_agent_by_name(ctx.conn, &req.agent)? else {
+            bail!("no live agent named {:?}", req.agent);
+        };
+        let notice = format!("{} retired {}", me.name, target.name);
+        retire(ctx, &me, &target, &notice)?;
+        Ok(proto::ByeResponse { name: target.name })
+    })
+}
+
+/// Announce "`notice` and left @group." from `by` to each of `target`'s
+/// groups, then retire `target`. Announce first: retirement drops the
+/// memberships.
+fn retire(ctx: &Ctx, by: &db::Principal, target: &db::Principal, notice: &str) -> Result<()> {
+    for (gid, group) in db::member_groups(ctx.conn, target.id)? {
+        broadcast(ctx, by, gid, &format!("{notice} and left @{group}."))?;
+    }
+    db::retire_agent(ctx.conn, target.id, &ctx.now_s)?;
+    tracing::info!(agent = target.name, by = by.name, "agent retired");
+    Ok(())
 }
 
 // ---- groups ----------------------------------------------------------------

@@ -461,6 +461,34 @@ fn bye_notifies_and_leaves_groups(mode: Mode) {
     assert_eq!(bbs.ok(&["group", "list"]), format!("@g: {b}\n@h: {c}\n"));
 }
 
+fn humans_retire_agents(mode: Mode) {
+    let bbs = Bbs::with_mode("retire", mode);
+    bbs.ok(&["human", "add", "ada"]);
+    bbs.ok(&["group", "register", "g"]);
+    let (a, ta) = bbs.register();
+    let (b, tb) = bbs.register();
+    for t in [&ta, &tb] {
+        bbs.ok(&["--token", t, "group", "join", "g"]);
+    }
+    bbs.ok(&["--token", &ta, "read"]);
+    bbs.ok(&["--as", "ada", "read"]);
+
+    assert!(
+        bbs.err(&["--token", &tb, "retire", &a])
+            .contains("humans only")
+    );
+    assert_eq!(bbs.ok(&["retire", &a]), format!("Retired {a}.\n"));
+    let notice = format!("from will (human) to @g:\nwill retired {a} and left @g.\n");
+    assert!(bbs.ok(&["--token", &tb, "read"]).contains(&notice));
+    assert!(bbs.ok(&["--as", "ada", "read"]).contains(&notice));
+    assert!(
+        bbs.err(&["--token", &ta, "read"])
+            .contains("unknown or retired token")
+    );
+    assert_eq!(bbs.ok(&["group", "list"]), format!("@g: {b}\n"));
+    assert!(bbs.err(&["retire", &a]).contains("no live agent"));
+}
+
 fn stale_agents_are_retired_on_register(mode: Mode) {
     let bbs = Bbs::with_mode("stale", mode);
     let (a, ta) = bbs.register();
@@ -998,6 +1026,7 @@ both_modes!(
     broadcast_reaches_members_and_humans,
     bye_retires_token_and_name,
     bye_notifies_and_leaves_groups,
+    humans_retire_agents,
     stale_agents_are_retired_on_register,
     human_name_is_reserved_and_permissions_enforced,
     whoami_reports_agent_or_human,

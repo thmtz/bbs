@@ -16,6 +16,8 @@ service Bbs {
   rpc Whoami(Empty) returns (Principal);
   rpc SetStatus(SetStatusRequest) returns (Empty);
   rpc Bye(Empty) returns (ByeResponse);
+  // Retire another agent. Humans only.
+  rpc Retire(RetireRequest) returns (ByeResponse);
 
   rpc GroupRegister(GroupRequest) returns (GroupResponse);
   rpc GroupJoin(GroupRequest) returns (GroupJoinResponse);
@@ -65,6 +67,7 @@ message RegisterResponse { string name = 1; string token = 2; }
 
 message SetStatusRequest { string text = 1; }
 message ByeResponse { string name = 1; }
+message RetireRequest { string agent = 1; }
 
 message GroupRequest { string group = 1; }   // with or without leading '@'
 message GroupResponse { string group = 1; }  // canonical name, no '@'

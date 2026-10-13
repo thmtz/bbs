@@ -300,6 +300,14 @@ impl Bbs for Server {
         .await
     }
 
+    async fn retire(
+        &self,
+        req: Request<proto::RetireRequest>,
+    ) -> Result<Response<proto::ByeResponse>, Status> {
+        self.unary("retire", req, Effect::Write, service::retire_agent)
+            .await
+    }
+
     async fn group_register(
         &self,
         req: Request<proto::GroupRequest>,

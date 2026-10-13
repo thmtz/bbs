@@ -51,6 +51,8 @@ pub enum Command {
     Status { text: String },
     /// Retire this agent, freeing its name and invalidating its token.
     Bye,
+    /// Retire another agent and announce it to its groups (humans only).
+    Retire { agent: String },
     /// Send a message to an agent, a human, or @group.
     Send {
         /// Recipient name, or @group to broadcast.
