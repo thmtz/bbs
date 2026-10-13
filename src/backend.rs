@@ -19,6 +19,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const FEED_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const WAIT_TOUCH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 pub enum Backend {
@@ -256,26 +257,19 @@ impl Backend {
         }
     }
 
-    /// One snapshot of the most recent `backlog` messages (humans only).
-    pub async fn feed(&mut self, backlog: u32) -> Result<Vec<proto::Message>> {
+    /// Watch the most recent `backlog` messages (humans only): the first
+    /// snapshot comes at once, then one after every change.
+    pub async fn watch_feed(&mut self, backlog: u32) -> Result<FeedWatch<'_>> {
         let req = proto::FeedRequest { backlog };
-        match self {
-            Backend::Local(l) => Ok(service::feed(&mut l.conn, &l.caller, req)?.messages),
-            Backend::Remote(r) => {
-                let mut stream = rpc!(r, watch_feed, req)?;
-                let snapshot = stream.message().await.map_err(status_error)?;
-                Ok(snapshot.map(|s| s.messages).unwrap_or_default())
-            }
-        }
-    }
-
-    /// A value that changes whenever the board may have changed, or `None`
-    /// when the backend cannot tell and the caller should just re-fetch.
-    pub fn change_marker(&self) -> Result<Option<i64>> {
-        match self {
-            Backend::Local(l) => Ok(Some(db::data_version(&l.conn)?)),
-            Backend::Remote(_) => Ok(None),
-        }
+        Ok(match self {
+            Backend::Local(local) => FeedWatch::Local {
+                local,
+                req,
+                seen: None,
+                next_poll: tokio::time::Instant::now(),
+            },
+            Backend::Remote(r) => FeedWatch::Remote(rpc!(r, watch_feed, req)?),
+        })
     }
 
     /// Block until the caller has unread mail, then take it as `read` would.
@@ -291,6 +285,47 @@ impl Backend {
                 }
                 Ok(msgs)
             }
+        }
+    }
+}
+
+pub enum FeedWatch<'a> {
+    /// Polls `data_version`, which changes only when another connection
+    /// commits, and re-fetches after a change.
+    Local {
+        local: &'a mut Local,
+        req: proto::FeedRequest,
+        seen: Option<i64>,
+        /// Kept across calls, so a cancelled `next` does not poll early.
+        next_poll: tokio::time::Instant,
+    },
+    /// The server pushes a snapshot after every change.
+    Remote(tonic::Streaming<proto::FeedSnapshot>),
+}
+
+impl FeedWatch<'_> {
+    /// The next snapshot. Cancel-safe: dropping the future loses nothing.
+    pub async fn next(&mut self) -> Result<Vec<proto::Message>> {
+        match self {
+            FeedWatch::Local {
+                local,
+                req,
+                seen,
+                next_poll,
+            } => loop {
+                tokio::time::sleep_until(*next_poll).await;
+                *next_poll = tokio::time::Instant::now() + FEED_POLL_INTERVAL;
+                let version = db::data_version(&local.conn)?;
+                if *seen != Some(version) {
+                    let snapshot = service::feed(&mut local.conn, &local.caller, *req)?;
+                    *seen = Some(version);
+                    return Ok(snapshot.messages);
+                }
+            },
+            FeedWatch::Remote(stream) => match stream.message().await.map_err(status_error)? {
+                Some(snapshot) => Ok(snapshot.messages),
+                None => bail!("the server closed the feed"),
+            },
         }
     }
 }
