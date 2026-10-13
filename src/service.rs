@@ -1,0 +1,680 @@
+//! Business logic: one function per command over a SQLite connection, taking
+//! and returning the protobuf types. Each runs in its own `IMMEDIATE`
+//! transaction, generates `now`, and resolves the caller. It knows nothing
+//! about sockets, files or output formatting.
+
+use std::collections::HashSet;
+
+use anyhow::{Context, Result, bail};
+use chrono::{DateTime, SecondsFormat, Utc};
+use rand::seq::IndexedRandom;
+use rusqlite::{Connection, TransactionBehavior};
+
+use crate::db;
+use crate::names::NAMES;
+use crate::proto;
+
+const RETIRE_AFTER_DAYS: i64 = 7;
+pub const MAX_BODY_BYTES: usize = 64 * 1024;
+/// `active_at` is refreshed at most this often.
+const ACTIVE_AT_DEBOUNCE: chrono::Duration = chrono::Duration::seconds(60);
+
+/// Who is calling: the agent owning `token`, else the human named `human`.
+#[derive(Debug, Default)]
+pub struct Caller {
+    pub token: Option<String>,
+    pub human: Option<String>,
+}
+
+const NO_CALLER: Caller = Caller {
+    token: None,
+    human: None,
+};
+
+pub fn fmt_time(t: DateTime<Utc>) -> String {
+    t.to_rfc3339_opts(SecondsFormat::Micros, true)
+}
+
+/// Run `f` in its own immediate (write-locking) transaction.
+fn with_ctx<T>(
+    conn: &mut Connection,
+    caller: &Caller,
+    f: impl FnOnce(&Ctx) -> Result<T>,
+) -> Result<T> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let now = Utc::now();
+    let ctx = Ctx {
+        conn: &tx,
+        now,
+        now_s: fmt_time(now),
+        caller,
+    };
+    let out = f(&ctx)?;
+    tx.commit()?;
+    Ok(out)
+}
+
+struct Ctx<'a> {
+    conn: &'a Connection,
+    now: DateTime<Utc>,
+    now_s: String,
+    caller: &'a Caller,
+}
+
+impl Ctx<'_> {
+    /// Cutoff for `db::touch_*`: only `active_at` values older than this are rewritten.
+    fn touch_cutoff(&self) -> String {
+        fmt_time(self.now - ACTIVE_AT_DEBOUNCE)
+    }
+
+    /// Resolve the caller and record activity.
+    fn actor(&self) -> Result<db::Principal> {
+        if let Some(token) = &self.caller.token {
+            let token = token.trim().to_ascii_lowercase();
+            let Some(agent) = db::agent_by_token(self.conn, &token)? else {
+                bail!("unknown or retired token; run `bbs register`");
+            };
+            db::touch_agent(self.conn, agent.id, &self.now_s, &self.touch_cutoff())?;
+            return Ok(agent);
+        }
+        let Some(name) = &self.caller.human else {
+            bail!("no caller identity; pass --token, or --as <human>");
+        };
+        let Some(human) = db::find_human(self.conn, name)? else {
+            bail!("unknown human {name:?}; run `bbs init` or `bbs human add {name}`");
+        };
+        db::touch_human(self.conn, human.id, &self.now_s, &self.touch_cutoff())?;
+        Ok(human)
+    }
+
+    fn agent(&self) -> Result<db::Principal> {
+        if self.caller.token.is_none() {
+            bail!("this command requires --token");
+        }
+        self.actor()
+    }
+
+    fn human(&self) -> Result<db::Principal> {
+        if self.caller.token.is_some() {
+            bail!("this command is for humans only");
+        }
+        self.actor()
+    }
+}
+
+fn proto_kind(kind: db::Kind) -> proto::Kind {
+    match kind {
+        db::Kind::Agent => proto::Kind::Agent,
+        db::Kind::Human => proto::Kind::Human,
+    }
+}
+
+fn principal(p: db::Principal) -> proto::Principal {
+    proto::Principal {
+        kind: proto_kind(p.kind).into(),
+        id: p.id,
+        name: p.name,
+    }
+}
+
+/// Direct messages from an inbox carry the reader's name as `to_name`.
+fn message(m: db::MessageView, reader: Option<&str>) -> proto::Message {
+    let to_name = match (&m.to_group, m.to_name) {
+        (None, None) => reader.map(str::to_string),
+        (_, to_name) => to_name,
+    };
+    proto::Message {
+        id: m.id,
+        created_at: m.created_at,
+        from_kind: proto_kind(m.from_kind).into(),
+        from_name: m.from_name,
+        to_group: m.to_group,
+        to_name,
+        read_at: m.read_at,
+        body: m.body,
+    }
+}
+
+fn validate_human_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+    if !ok {
+        bail!("invalid human name {name:?}: use letters, digits, '.', '_' or '-'");
+    }
+    Ok(())
+}
+
+fn validate_group_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && name.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_-".contains(c));
+    if !ok {
+        bail!("invalid group name {name:?}: use lowercase letters, digits, '_' or '-'");
+    }
+    Ok(())
+}
+
+fn validate_body(body: &str) -> Result<()> {
+    if body.trim().is_empty() {
+        bail!("message body is empty");
+    }
+    if body.len() > MAX_BODY_BYTES {
+        bail!("message body exceeds {} KiB", MAX_BODY_BYTES / 1024);
+    }
+    Ok(())
+}
+
+fn insert_human(ctx: &Ctx, name: &str) -> Result<()> {
+    validate_human_name(name)?;
+    if db::find_human(ctx.conn, name)?.is_some() {
+        bail!("human {name:?} already exists");
+    }
+    if db::live_agent_by_name(ctx.conn, name)?.is_some() {
+        bail!("{name:?} is in use by an agent");
+    }
+    db::insert_human(ctx.conn, name, &ctx.now_s)?;
+    tracing::info!(human = name, "added human");
+    Ok(())
+}
+
+// ---- identities ------------------------------------------------------------
+
+pub fn ensure_human(
+    conn: &mut Connection,
+    req: proto::EnsureHumanRequest,
+) -> Result<proto::EnsureHumanResponse> {
+    with_ctx(conn, &NO_CALLER, |ctx| {
+        let created = db::find_human(ctx.conn, &req.name)?.is_none();
+        if created {
+            insert_human(ctx, &req.name)?;
+        }
+        Ok(proto::EnsureHumanResponse { created })
+    })
+}
+
+pub fn add_human(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::AddHumanRequest,
+) -> Result<proto::Empty> {
+    with_ctx(conn, caller, |ctx| {
+        ctx.human()?;
+        insert_human(ctx, &req.name)?;
+        Ok(proto::Empty {})
+    })
+}
+
+fn pick_name(conn: &Connection) -> Result<String> {
+    let taken = db::taken_names(conn)?;
+    let last_used = db::name_last_used(conn)?;
+    let free: Vec<&str> = NAMES
+        .iter()
+        .copied()
+        .filter(|n| !taken.contains(&n.to_lowercase()))
+        .collect();
+    let never_used: Vec<&str> = free
+        .iter()
+        .copied()
+        .filter(|n| !last_used.contains_key(&n.to_lowercase()))
+        .collect();
+    if let Some(name) = never_used.choose(&mut rand::rng()) {
+        return Ok(name.to_string());
+    }
+    // Every free name has been used before: recycle the least recently used one.
+    free.iter()
+        .min_by_key(|n| last_used.get(&n.to_lowercase()))
+        .map(|n| n.to_string())
+        .with_context(|| format!("name pool exhausted: all {} names are in use", NAMES.len()))
+}
+
+fn new_token(conn: &Connection) -> Result<String> {
+    loop {
+        let bytes: [u8; 4] = rand::random();
+        let token = data_encoding::BASE32_NOPAD
+            .encode(&bytes)
+            .to_ascii_lowercase();
+        if !db::token_exists(conn, &token)? {
+            return Ok(token);
+        }
+    }
+}
+
+pub fn register(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::RegisterRequest,
+) -> Result<proto::RegisterResponse> {
+    with_ctx(conn, caller, |ctx| {
+        if ctx.caller.token.is_some() {
+            bail!("already registered; `bbs bye` first to register again");
+        }
+        let cutoff = fmt_time(ctx.now - chrono::Duration::days(RETIRE_AFTER_DAYS));
+        for id in db::stale_agent_ids(ctx.conn, &cutoff)? {
+            db::retire_agent(ctx.conn, id, &ctx.now_s)?;
+            tracing::info!(agent_id = id, "retired stale agent");
+        }
+        let name = pick_name(ctx.conn)?;
+        let token = new_token(ctx.conn)?;
+        let id = db::insert_agent(
+            ctx.conn,
+            &db::NewAgent {
+                name: &name,
+                token: &token,
+                status: req.note.as_deref(),
+                pwd: &req.pwd,
+                hostname: &req.hostname,
+                now: &ctx.now_s,
+            },
+        )?;
+        tracing::info!(
+            agent_id = id,
+            name,
+            pwd = req.pwd,
+            hostname = req.hostname,
+            "registered agent"
+        );
+        Ok(proto::RegisterResponse { name, token })
+    })
+}
+
+pub fn whoami(conn: &mut Connection, caller: &Caller) -> Result<proto::Principal> {
+    with_ctx(conn, caller, |ctx| Ok(principal(ctx.actor()?)))
+}
+
+pub fn set_status(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::SetStatusRequest,
+) -> Result<proto::Empty> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.agent()?;
+        db::set_status(ctx.conn, me.id, &req.text, &ctx.now_s)?;
+        Ok(proto::Empty {})
+    })
+}
+
+pub fn bye(conn: &mut Connection, caller: &Caller) -> Result<proto::ByeResponse> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.agent()?;
+        db::retire_agent(ctx.conn, me.id, &ctx.now_s)?;
+        tracing::info!(agent = me.name, "agent retired");
+        Ok(proto::ByeResponse { name: me.name })
+    })
+}
+
+// ---- groups ----------------------------------------------------------------
+
+fn group_name(group: &str) -> &str {
+    group.strip_prefix('@').unwrap_or(group)
+}
+
+fn require_group(conn: &Connection, group: &str) -> Result<i64> {
+    db::group_id(conn, group)?.with_context(|| format!("no such group @{group}"))
+}
+
+pub fn group_register(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::GroupRequest,
+) -> Result<proto::GroupResponse> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.human()?;
+        let group = group_name(&req.group);
+        validate_group_name(group)?;
+        if db::group_id(ctx.conn, group)?.is_some() {
+            bail!("group @{group} already exists");
+        }
+        db::insert_group(ctx.conn, group, &ctx.now_s)?;
+        tracing::info!(group, by = me.name, "registered group");
+        Ok(proto::GroupResponse {
+            group: group.to_string(),
+        })
+    })
+}
+
+pub fn group_join(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::GroupRequest,
+) -> Result<proto::GroupJoinResponse> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.agent()?;
+        let group = group_name(&req.group);
+        let gid = require_group(ctx.conn, group)?;
+        let joined = db::join_group(ctx.conn, gid, me.id, &ctx.now_s)?;
+        if joined {
+            tracing::info!(agent = me.name, group, "joined group");
+        }
+        Ok(proto::GroupJoinResponse {
+            group: group.to_string(),
+            joined,
+        })
+    })
+}
+
+pub fn group_leave(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::GroupRequest,
+) -> Result<proto::GroupResponse> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.agent()?;
+        let group = group_name(&req.group);
+        let gid = require_group(ctx.conn, group)?;
+        if !db::is_member(ctx.conn, gid, me.id)? {
+            bail!("you are not in @{group}");
+        }
+        broadcast(ctx, &me, gid, &format!("{} left @{group}.", me.name))?;
+        db::leave_group(ctx.conn, gid, me.id)?;
+        tracing::info!(agent = me.name, group, "left group");
+        Ok(proto::GroupResponse {
+            group: group.to_string(),
+        })
+    })
+}
+
+pub fn group_remove(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::GroupRemoveRequest,
+) -> Result<proto::GroupRemoveResponse> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.human()?;
+        let group = group_name(&req.group);
+        let gid = require_group(ctx.conn, group)?;
+        let Some(target) = db::live_agent_by_name(ctx.conn, &req.agent)? else {
+            bail!("no live agent named {:?}", req.agent);
+        };
+        if !db::is_member(ctx.conn, gid, target.id)? {
+            bail!("{} is not in @{group}", target.name);
+        }
+        // Notify before removing so the removed agent learns why the group went quiet.
+        let notice = format!("{} removed {} from @{group}.", me.name, target.name);
+        broadcast(ctx, &me, gid, &notice)?;
+        db::leave_group(ctx.conn, gid, target.id)?;
+        tracing::info!(
+            agent = target.name,
+            group,
+            by = me.name,
+            "removed from group"
+        );
+        Ok(proto::GroupRemoveResponse {
+            group: group.to_string(),
+            agent: target.name,
+        })
+    })
+}
+
+pub fn group_list(conn: &mut Connection, caller: &Caller) -> Result<proto::GroupListResponse> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.actor()?;
+        let only = (me.kind == db::Kind::Agent).then_some(me.id);
+        let groups = db::list_groups(ctx.conn, only)?
+            .into_iter()
+            .map(|(name, members)| proto::Group { name, members })
+            .collect();
+        Ok(proto::GroupListResponse { groups })
+    })
+}
+
+// ---- messages --------------------------------------------------------------
+
+/// Deliver `body` from `me` to every member of the group and every human,
+/// except `me`. Returns (recipients, recipients visible to `me`): humans
+/// silently receive every broadcast, so agents only see the agent count.
+fn broadcast(ctx: &Ctx, me: &db::Principal, gid: i64, body: &str) -> Result<(usize, usize)> {
+    let msg = db::insert_message(ctx.conn, me, Some(gid), body, &ctx.now_s)?;
+    let mut count = 0;
+    let mut visible = 0;
+    let agents = db::group_member_ids(ctx.conn, gid)?
+        .into_iter()
+        .map(|id| (db::Kind::Agent, id));
+    let humans = db::human_ids(ctx.conn)?
+        .into_iter()
+        .map(|id| (db::Kind::Human, id));
+    for (kind, id) in agents.chain(humans) {
+        if kind == me.kind && id == me.id {
+            continue;
+        }
+        db::insert_delivery(ctx.conn, msg, kind, id)?;
+        count += 1;
+        if me.kind == db::Kind::Human || kind == db::Kind::Agent {
+            visible += 1;
+        }
+    }
+    Ok((count, visible))
+}
+
+pub fn send(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::SendRequest,
+) -> Result<proto::SendResponse> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.actor()?;
+        let (to, body) = (req.to.as_str(), req.body.as_str());
+        validate_body(body)?;
+
+        if let Some(group) = to.strip_prefix('@') {
+            let gid = require_group(ctx.conn, group)?;
+            if me.kind == db::Kind::Agent && !db::is_member(ctx.conn, gid, me.id)? {
+                bail!("you are not a member of @{group}");
+            }
+            let (count, visible) = broadcast(ctx, &me, gid, body)?;
+            tracing::info!(
+                from = me.name,
+                to,
+                recipients = count,
+                bytes = body.len(),
+                "sent broadcast"
+            );
+            return Ok(proto::SendResponse {
+                to: format!("@{group}"),
+                recipients: Some(visible as u32),
+            });
+        }
+
+        let target = match db::find_human(ctx.conn, to)? {
+            Some(h) => h,
+            None => match db::live_agent_by_name(ctx.conn, to)? {
+                Some(a) => a,
+                None if db::retired_agent_exists(ctx.conn, to)? => {
+                    bail!("{to} is offline (retired)")
+                }
+                None => bail!("no such agent or human: {to}"),
+            },
+        };
+        if target.kind == me.kind && target.id == me.id {
+            bail!("cannot send a message to yourself");
+        }
+        if me.kind == db::Kind::Agent && target.kind == db::Kind::Human {
+            bail!(
+                "agents cannot message humans; talk to {} through your harness",
+                target.name
+            );
+        }
+        if me.kind == db::Kind::Agent
+            && target.kind == db::Kind::Agent
+            && !db::share_group(ctx.conn, me.id, target.id)?
+        {
+            bail!("{} is not in any of your groups", target.name);
+        }
+        let msg = db::insert_message(ctx.conn, &me, None, body, &ctx.now_s)?;
+        db::insert_delivery(ctx.conn, msg, target.kind, target.id)?;
+        tracing::info!(
+            from = me.name,
+            to = target.name,
+            bytes = body.len(),
+            "sent message"
+        );
+        Ok(proto::SendResponse {
+            to: target.name,
+            recipients: None,
+        })
+    })
+}
+
+/// Unread mail oldest first, archived as returned; or archived history.
+pub fn read(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::ReadRequest,
+) -> Result<proto::ReadResponse> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.actor()?;
+        let msgs = if req.archived {
+            let since = req
+                .since
+                .as_deref()
+                .map(|s| {
+                    DateTime::parse_from_rfc3339(s)
+                        .map(|t| fmt_time(t.with_timezone(&Utc)))
+                        .with_context(|| format!("invalid since {s:?}: expected RFC3339"))
+                })
+                .transpose()?;
+            db::archived_since(ctx.conn, &me, since.as_deref(), req.limit)?
+        } else {
+            let from_kind = match req.from_kind.map(proto::Kind::try_from) {
+                Some(Ok(proto::Kind::Agent)) => Some(db::Kind::Agent),
+                Some(Ok(proto::Kind::Human)) => Some(db::Kind::Human),
+                _ => None,
+            };
+            let msgs = db::take_unread(ctx.conn, &me, from_kind, req.limit, &ctx.now_s)?;
+            if !msgs.is_empty() {
+                tracing::info!(reader = me.name, count = msgs.len(), "archived messages");
+            }
+            msgs
+        };
+        let messages = msgs
+            .into_iter()
+            .map(|m| message(m, Some(&me.name)))
+            .collect();
+        Ok(proto::ReadResponse { messages })
+    })
+}
+
+pub fn list_agents(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::ListAgentsRequest,
+) -> Result<proto::ListAgentsResponse> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.actor()?;
+        let mut groups = db::agent_groups(ctx.conn)?;
+        let mut rows = db::list_agents(ctx.conn, req.all && me.kind == db::Kind::Human)?;
+        if me.kind == db::Kind::Agent {
+            let mine: HashSet<&String> = groups.get(&me.id).into_iter().flatten().collect();
+            rows.retain(|a| {
+                a.id == me.id
+                    || groups
+                        .get(&a.id)
+                        .into_iter()
+                        .flatten()
+                        .any(|g| mine.contains(g))
+            });
+        }
+        // Agents cannot message humans, so humans are not listed for them.
+        let humans = match me.kind {
+            db::Kind::Human => db::list_humans(ctx.conn)?,
+            db::Kind::Agent => Vec::new(),
+        };
+        let humans = humans
+            .into_iter()
+            .map(|h| proto::Human {
+                name: h.name,
+                active_at: h.active_at,
+            })
+            .collect();
+        let agents = rows
+            .into_iter()
+            .map(|a| proto::Agent {
+                groups: groups.remove(&a.id).unwrap_or_default(),
+                name: a.name,
+                status: a.status,
+                pwd: a.pwd,
+                hostname: a.hostname,
+                active_at: a.active_at,
+                retired: a.retired_at.is_some(),
+            })
+            .collect();
+        Ok(proto::ListAgentsResponse { humans, agents })
+    })
+}
+
+/// The most recent `backlog` messages across the whole board, oldest first.
+/// Humans only; never archives anything.
+pub fn feed(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::FeedRequest,
+) -> Result<proto::FeedSnapshot> {
+    with_ctx(conn, caller, |ctx| {
+        ctx.human()?;
+        let messages = db::recent_messages(ctx.conn, req.backlog)?
+            .into_iter()
+            .map(|m| message(m, None))
+            .collect();
+        Ok(proto::FeedSnapshot { messages })
+    })
+}
+
+// ---- harness sessions ------------------------------------------------------
+
+/// Bind a harness session to the agent owning `token`. A session holds one
+/// identity, so an agent it was previously bound to is retired. An unknown
+/// token binds nothing and returns no agent.
+pub fn bind_session(
+    conn: &mut Connection,
+    req: proto::BindSessionRequest,
+) -> Result<proto::BindSessionResponse> {
+    with_ctx(conn, &NO_CALLER, |ctx| {
+        let Some(agent) = db::agent_by_token(ctx.conn, &req.token)? else {
+            return Ok(proto::BindSessionResponse { agent: None });
+        };
+        let previous = db::bind_session(
+            ctx.conn,
+            &req.harness,
+            &req.session_id,
+            agent.id,
+            &ctx.now_s,
+        )?;
+        if let Some(previous) = previous {
+            db::retire_agent(ctx.conn, previous, &ctx.now_s)?;
+            tracing::info!(agent_id = previous, "retired agent replaced in session");
+        }
+        tracing::info!(
+            harness = req.harness,
+            session_id = req.session_id,
+            agent = agent.name,
+            "bound session"
+        );
+        Ok(proto::BindSessionResponse {
+            agent: Some(principal(agent)),
+        })
+    })
+}
+
+/// The live agent bound to a harness session, with its token; both unset if unbound.
+pub fn session_agent(
+    conn: &mut Connection,
+    req: proto::SessionAgentRequest,
+) -> Result<proto::SessionAgentResponse> {
+    with_ctx(conn, &NO_CALLER, |ctx| {
+        Ok(
+            match db::session_agent(ctx.conn, &req.harness, &req.session_id)? {
+                Some((agent, token)) => proto::SessionAgentResponse {
+                    agent: Some(principal(agent)),
+                    token,
+                },
+                None => proto::SessionAgentResponse::default(),
+            },
+        )
+    })
+}
