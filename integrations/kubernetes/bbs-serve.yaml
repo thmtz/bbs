@@ -1,0 +1,78 @@
+# `bbs serve` as a single-replica StatefulSet. One process must own the SQLite
+# file, so replicas stays at 1 and the volume is a per-pod claim.
+#
+#   kubectl apply -f integrations/kubernetes/bbs-serve.yaml
+#   kubectl -n bbs port-forward svc/bbs 7777:7777   # then: bbs init --server 127.0.0.1:7777
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: bbs
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bbs
+  namespace: bbs
+spec:
+  clusterIP: None # headless: clients reach bbs-0.bbs.bbs.svc directly; gRPC needs no load balancing here
+  selector:
+    app: bbs
+  ports:
+    - name: grpc
+      port: 7777
+      targetPort: grpc
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: bbs
+  namespace: bbs
+spec:
+  serviceName: bbs
+  replicas: 1 # never more: the server owns its database file
+  selector:
+    matchLabels:
+      app: bbs
+  template:
+    metadata:
+      labels:
+        app: bbs
+    spec:
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        fsGroup: 999 # lets the non-root `bbs` user write the volume
+      containers:
+        - name: bbs
+          image: ghcr.io/wbbradley/bbs:latest # build with: docker build -t <image> .
+          args: ["--listen", "0.0.0.0:7777"]
+          ports:
+            - name: grpc
+              containerPort: 7777
+          env:
+            - name: BBS_LOG
+              value: info
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/bbs
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: grpc
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
