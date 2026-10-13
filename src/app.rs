@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 
 use crate::cli::{Cli, Command, GroupCommand, HumanCommand};
+use crate::config::Config;
 use crate::db::{self, Kind};
 use crate::proto;
 use crate::service::{self, Caller, MAX_BODY_BYTES, fmt_time};
@@ -35,12 +36,18 @@ pub fn run(cli: Cli) -> Result<()> {
     let dir = state_dir()?;
     let db_path = dir.join("bbs.db");
     match &cli.command {
-        Command::Init { human } => return init(&dir, &db_path, human.as_deref()),
+        Command::Init { server, human } => {
+            return init(&dir, &db_path, server, human, cli.as_human.as_deref());
+        }
         Command::Hook { harness } => return crate::hook::run(*harness, &db_path),
         Command::Serve { listen, state_dir } => {
             return crate::serve::run(*listen, state_dir.as_deref().unwrap_or(&dir));
         }
         _ => {}
+    }
+    let config = Config::load()?;
+    if config.server.is_some() {
+        bail!("remote mode is not implemented yet");
     }
     if !db_path.exists() {
         bail!("BBS is not initialized; run `bbs init`");
@@ -49,7 +56,7 @@ pub fn run(cli: Cli) -> Result<()> {
     db::migrate(&mut conn)?;
     let caller = Caller {
         token: cli.token.clone(),
-        human: cli.as_human.clone().or_else(|| std::env::var("USER").ok()),
+        human: config.human(cli.as_human.as_deref()),
     };
     match cli.command {
         Command::View => crate::view::run(&mut conn, &caller),
@@ -227,14 +234,33 @@ fn dispatch(conn: &mut Connection, caller: &Caller, command: Command) -> Result<
     })
 }
 
-fn init(dir: &Path, db_path: &Path, human: Option<&str>) -> Result<()> {
+/// Merge `--server`/`--human` into the config file, then set up the local
+/// database unless a server is configured.
+fn init(
+    dir: &Path,
+    db_path: &Path,
+    server: &Option<String>,
+    human: &Option<String>,
+    as_human: Option<&str>,
+) -> Result<()> {
+    if server.is_some() || human.is_some() {
+        let mut file = Config::read()?;
+        file.server = server.clone().or(file.server);
+        file.human = human.clone().or(file.human);
+        file.write()?;
+    }
+    let config = Config::load()?;
+    if let Some(server) = &config.server {
+        println!("BBS configured for server {server}");
+        return Ok(());
+    }
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let mut conn = db::open(db_path)?;
     db::migrate(&mut conn)?;
-    let name = match human {
-        Some(name) => name.to_string(),
-        None => std::env::var("USER").context("$USER is not set; pass --human <name>")?,
-    };
+    let name = human
+        .clone()
+        .or_else(|| config.human(as_human))
+        .context("$USER is not set; pass --human <name>")?;
     service::ensure_human(&mut conn, proto::EnsureHumanRequest { name: name.clone() })?;
     println!("BBS initialized at {}\nHuman: {name}", dir.display());
     Ok(())

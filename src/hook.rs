@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 
 use crate::app::{format_messages, identity_line};
 use crate::cli::Harness;
+use crate::config::Config;
 use crate::db;
 use crate::proto;
 use crate::service::{self, Caller};
@@ -24,7 +25,8 @@ pub fn run(harness: Harness, db_path: &Path) -> Result<()> {
 fn handle(harness: Harness, db_path: &Path) -> Result<()> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
-    if !db_path.exists() {
+    // Hooks over a server arrive with the remote backend; until then, stay silent.
+    if Config::load()?.server.is_some() || !db_path.exists() {
         return Ok(());
     }
     let event: Value = serde_json::from_str(&input).context("parsing hook input")?;

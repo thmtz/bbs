@@ -14,9 +14,11 @@ prost = "0.14.4"
 rand = "0.9"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 tokio-stream = { version = "0.1.19", features = ["net"] }
+toml = "1.1.8"
 tonic = "0.14.6"
 tonic-prost = "0.14.6"
 tracing = "0.1.44"

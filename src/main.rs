@@ -1,5 +1,6 @@
 mod app;
 mod cli;
+mod config;
 mod db;
 mod hook;
 mod names;
