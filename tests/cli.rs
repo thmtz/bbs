@@ -1,19 +1,101 @@
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+
+/// Which backend the CLI under test uses.
+#[derive(Clone, Copy, Debug)]
+enum Mode {
+    /// The CLI opens ~/.local/state/bbs/bbs.db itself.
+    Local,
+    /// The CLI talks to a `bbs serve` spawned for the test, via `BBS_SERVER`.
+    Remote,
+}
+
+/// Generate `local::<test>` and `remote::<test>` for each `fn <test>(mode: Mode)`.
+macro_rules! both_modes {
+    ($($name:ident),* $(,)?) => {
+        mod local {
+            $(#[test] fn $name() { super::$name(super::Mode::Local) })*
+        }
+        mod remote {
+            $(#[test] fn $name() { super::$name(super::Mode::Remote) })*
+        }
+    };
+}
+
+struct Server {
+    child: Child,
+    addr: String,
+    state: PathBuf,
+}
+
+impl Server {
+    fn start(home: &PathBuf) -> Server {
+        let state = home.join("server-state");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_bbs"))
+            .args(["serve", "--listen", "127.0.0.1:0", "--state-dir"])
+            .arg(&state)
+            .env("HOME", home)
+            .env_remove("BBS_SERVER")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let addr = line
+            .trim()
+            .strip_prefix("bbs serve listening on ")
+            .unwrap_or_else(|| panic!("unexpected serve output: {line:?}"))
+            .to_string();
+        Server { child, addr, state }
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
 
 struct Bbs {
     home: PathBuf,
+    server: Option<Server>,
 }
 
 impl Bbs {
     fn new(test: &str) -> Bbs {
-        let home = std::env::temp_dir().join(format!("bbs-test-{}-{test}", std::process::id()));
+        Bbs::with_mode(test, Mode::Local)
+    }
+
+    fn with_mode(test: &str, mode: Mode) -> Bbs {
+        let home =
+            std::env::temp_dir().join(format!("bbs-test-{}-{test}-{mode:?}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
-        let bbs = Bbs { home };
+        let server = match mode {
+            Mode::Local => None,
+            Mode::Remote => Some(Server::start(&home)),
+        };
+        let bbs = Bbs { home, server };
         bbs.ok(&["init"]);
         bbs
+    }
+
+    /// A `bbs` invocation as the human "will", pointed at this test's backend.
+    fn command(&self, args: &[&str]) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_bbs"));
+        cmd.args(args)
+            .env("HOME", &self.home)
+            .env("USER", "will")
+            .env_remove("BBS_SERVER");
+        if let Some(server) = &self.server {
+            cmd.env("BBS_SERVER", &server.addr);
+        }
+        cmd
     }
 
     fn run_with_stdin(&self, args: &[&str], stdin: &str) -> Output {
@@ -21,11 +103,8 @@ impl Bbs {
     }
 
     fn run_with_env(&self, args: &[&str], stdin: &str, env: &[(&str, &str)]) -> Output {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_bbs"))
-            .args(args)
-            .env("HOME", &self.home)
-            .env("USER", "will")
-            .env_remove("BBS_SERVER")
+        let mut child = self
+            .command(args)
             .envs(env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -77,13 +156,20 @@ impl Bbs {
         (name, token)
     }
 
+    /// The backend's database: the server's in remote mode.
     fn db(&self) -> rusqlite::Connection {
-        rusqlite::Connection::open(self.home.join(".local/state/bbs/bbs.db")).unwrap()
+        let state = match &self.server {
+            Some(server) => server.state.clone(),
+            None => self.home.join(".local/state/bbs"),
+        };
+        rusqlite::Connection::open(state.join("bbs.db")).unwrap()
     }
 }
 
 impl Drop for Bbs {
     fn drop(&mut self) {
+        // Stop the server before removing its state directory.
+        self.server = None;
         let _ = std::fs::remove_dir_all(&self.home);
     }
 }
@@ -103,9 +189,8 @@ fn requires_init() {
     std::fs::remove_dir_all(&home).unwrap();
 }
 
-#[test]
-fn init_is_idempotent() {
-    let bbs = Bbs::new("reinit");
+fn init_is_idempotent(mode: Mode) {
+    let bbs = Bbs::with_mode("reinit", mode);
     bbs.ok(&["group", "register", "acme"]);
     let (_, token) = bbs.register();
 
@@ -183,44 +268,10 @@ fn bbs_server_env_overrides_config() {
     assert!(!config_path(&bbs).exists());
 }
 
-/// A `bbs serve` process on a loopback port, with its own state directory.
-struct Server {
-    child: std::process::Child,
-    addr: String,
-}
-
-impl Server {
-    fn start(bbs: &Bbs) -> Server {
-        let state = bbs.home.join("server");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_bbs"))
-            .args(["serve", "--listen", "127.0.0.1:0", "--state-dir"])
-            .arg(&state)
-            .env("HOME", &bbs.home)
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut line = String::new();
-        std::io::BufRead::read_line(
-            &mut std::io::BufReader::new(child.stdout.take().unwrap()),
-            &mut line,
-        )
-        .unwrap();
-        let addr = line.trim().rsplit(' ').next().unwrap().to_string();
-        Server { child, addr }
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
 #[test]
 fn remote_backend_round_trip() {
     let bbs = Bbs::new("remote");
-    let server = Server::start(&bbs);
+    let server = Server::start(&bbs.home);
     let out = bbs.ok(&["init", "--server", &server.addr]);
     assert!(out.contains("Human: will"), "{out}");
 
@@ -274,9 +325,8 @@ fn remote_backend_round_trip() {
     assert_eq!(local_agents, 0);
 }
 
-#[test]
-fn direct_messages_within_group() {
-    let bbs = Bbs::new("dm");
+fn direct_messages_within_group(mode: Mode) {
+    let bbs = Bbs::with_mode("dm", mode);
     bbs.ok(&["group", "register", "acme"]);
     let (a, ta) = bbs.register();
     let (b, tb) = bbs.register();
@@ -303,9 +353,8 @@ fn direct_messages_within_group() {
     assert!(out.contains("hello there"), "{out}");
 }
 
-#[test]
-fn humans_message_agents_and_humans_but_agents_cannot_dm_humans() {
-    let bbs = Bbs::new("human");
+fn humans_message_agents_and_humans_but_agents_cannot_dm_humans(mode: Mode) {
+    let bbs = Bbs::with_mode("human", mode);
     bbs.ok(&["human", "add", "alice"]);
     let (a, ta) = bbs.register();
     assert!(
@@ -326,9 +375,8 @@ fn humans_message_agents_and_humans_but_agents_cannot_dm_humans() {
     assert!(out.contains("multi\nline\n"), "{out}");
 }
 
-#[test]
-fn broadcast_reaches_members_and_humans() {
-    let bbs = Bbs::new("broadcast");
+fn broadcast_reaches_members_and_humans(mode: Mode) {
+    let bbs = Bbs::with_mode("broadcast", mode);
     bbs.ok(&["group", "register", "acme"]);
     bbs.ok(&["human", "add", "alice"]);
     let (a, ta) = bbs.register();
@@ -360,9 +408,8 @@ fn broadcast_reaches_members_and_humans() {
     );
 }
 
-#[test]
-fn bye_retires_token_and_name() {
-    let bbs = Bbs::new("bye");
+fn bye_retires_token_and_name(mode: Mode) {
+    let bbs = Bbs::with_mode("bye", mode);
     let (a, ta) = bbs.register();
     bbs.ok(&["send", "--to", &a, "unread"]);
     bbs.ok(&["--token", &ta, "bye"]);
@@ -375,9 +422,8 @@ fn bye_retires_token_and_name() {
     assert!(bbs.ok(&["agents", "--all"]).contains("retired"));
 }
 
-#[test]
-fn stale_agents_are_retired_on_register() {
-    let bbs = Bbs::new("stale");
+fn stale_agents_are_retired_on_register(mode: Mode) {
+    let bbs = Bbs::with_mode("stale", mode);
     let (a, ta) = bbs.register();
     bbs.ok(&["send", "--to", &a, "old news"]);
     bbs.db()
@@ -402,9 +448,8 @@ fn stale_agents_are_retired_on_register() {
     assert_eq!(unread, 0);
 }
 
-#[test]
-fn human_name_is_reserved_and_permissions_enforced() {
-    let bbs = Bbs::new("perms");
+fn human_name_is_reserved_and_permissions_enforced(mode: Mode) {
+    let bbs = Bbs::with_mode("perms", mode);
     let (_a, ta) = bbs.register();
     assert!(
         bbs.err(&["--token", &ta, "group", "register", "x"])
@@ -429,9 +474,8 @@ fn human_name_is_reserved_and_permissions_enforced() {
     assert_eq!(taken, 0);
 }
 
-#[test]
-fn whoami_reports_agent_or_human() {
-    let bbs = Bbs::new("whoami");
+fn whoami_reports_agent_or_human(mode: Mode) {
+    let bbs = Bbs::with_mode("whoami", mode);
     let (a, ta) = bbs.register();
     assert_eq!(bbs.ok(&["--token", &ta, "whoami"]), format!("{a}\n"));
     assert_eq!(bbs.ok(&["whoami"]), "will\n");
@@ -448,9 +492,8 @@ fn whoami_reports_agent_or_human() {
     );
 }
 
-#[test]
-fn humans_remove_agents_from_groups() {
-    let bbs = Bbs::new("remove");
+fn humans_remove_agents_from_groups(mode: Mode) {
+    let bbs = Bbs::with_mode("remove", mode);
     bbs.ok(&["group", "register", "acme"]);
     let (a, ta) = bbs.register();
     let (b, tb) = bbs.register();
@@ -484,9 +527,8 @@ fn humans_remove_agents_from_groups() {
     );
 }
 
-#[test]
-fn leaving_or_removal_notifies_the_group() {
-    let bbs = Bbs::new("depart");
+fn leaving_or_removal_notifies_the_group(mode: Mode) {
+    let bbs = Bbs::with_mode("depart", mode);
     bbs.ok(&["human", "add", "ada"]);
     bbs.ok(&["group", "register", "acme"]);
     let (a, ta) = bbs.register();
@@ -515,9 +557,8 @@ fn leaving_or_removal_notifies_the_group() {
     assert_eq!(bbs.ok(&["group", "list"]), format!("@acme: {b}\n"));
 }
 
-#[test]
-fn agents_lists_status_and_scopes_visibility() {
-    let bbs = Bbs::new("agents");
+fn agents_lists_status_and_scopes_visibility(mode: Mode) {
+    let bbs = Bbs::with_mode("agents", mode);
     bbs.ok(&["group", "register", "acme"]);
     let (a, ta) = bbs.register();
     let (b, tb) = bbs.register();
@@ -549,9 +590,8 @@ fn hook(bbs: &Bbs, event: serde_json::Value) -> Option<serde_json::Value> {
     (!stdout.trim().is_empty()).then(|| serde_json::from_str(&stdout).unwrap())
 }
 
-#[test]
-fn active_at_writes_are_debounced() {
-    let bbs = Bbs::new("debounce");
+fn active_at_writes_are_debounced(mode: Mode) {
+    let bbs = Bbs::with_mode("debounce", mode);
     let register_out = bbs.ok(&["register"]);
     let (_, ta) = bbs.register();
     let post_tool = |command: &str, stdout: &str| {
@@ -599,9 +639,8 @@ fn active_at_writes_are_debounced() {
     assert_eq!(stale, 0);
 }
 
-#[test]
-fn claude_code_hooks_bind_and_deliver() {
-    let bbs = Bbs::new("hook");
+fn claude_code_hooks_bind_and_deliver(mode: Mode) {
+    let bbs = Bbs::with_mode("hook", mode);
     bbs.ok(&["group", "register", "acme"]);
     let register_out = bbs.ok(&["register"]);
     let (a, ta) = (
@@ -680,9 +719,8 @@ fn claude_code_hooks_bind_and_deliver() {
     assert!(bbs.err(&["--token", &ta, "read"]).contains("retired"));
 }
 
-#[test]
-fn codex_hooks_bind_from_string_tool_response() {
-    let bbs = Bbs::new("codex");
+fn codex_hooks_bind_from_string_tool_response(mode: Mode) {
+    let bbs = Bbs::with_mode("codex", mode);
     let register_out = bbs.ok(&["register"]);
     let token = register_out
         .split("--token ")
@@ -728,11 +766,7 @@ fn codex_hooks_bind_from_string_tool_response() {
 
 impl Bbs {
     fn spawn(&self, args: &[&str]) -> std::process::Child {
-        Command::new(env!("CARGO_BIN_EXE_bbs"))
-            .args(args)
-            .env("HOME", &self.home)
-            .env("USER", "will")
-            .env_remove("BBS_SERVER")
+        self.command(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -753,9 +787,8 @@ fn wait_exit(child: &mut std::process::Child, secs: u64) -> Option<std::process:
     None
 }
 
-#[test]
-fn read_wait_blocks_until_mail_arrives() {
-    let bbs = Bbs::new("wait");
+fn read_wait_blocks_until_mail_arrives(mode: Mode) {
+    let bbs = Bbs::with_mode("wait", mode);
     let (a, ta) = bbs.register();
     let (b, _tb) = bbs.register();
     assert!(
@@ -796,19 +829,19 @@ fn read_wait_blocks_until_mail_arrives() {
     assert_eq!(bbs.ok(&["--token", &ta, "read"]), "");
 }
 
-#[test]
-fn only_one_read_wait_per_inbox() {
-    let bbs = Bbs::new("wait-lock");
+fn only_one_read_wait_per_inbox(mode: Mode) {
+    let bbs = Bbs::with_mode("wait-lock", mode);
     let (a, ta) = bbs.register();
     let (b, tb) = bbs.register();
     let mut first = bbs.spawn(&["--token", &ta, "read", "--wait"]);
     std::thread::sleep(std::time::Duration::from_millis(500));
 
-    // A second waiter fails fast without consuming mail; other inboxes are unaffected.
-    bbs.ok(&["send", "--to", &a, "for the first waiter"]);
+    // A second waiter fails fast; other inboxes are unaffected. Try it before
+    // sending, since a waiter that gets mail exits and frees the inbox at once.
     let err = bbs.err(&["--token", &ta, "read", "--wait"]);
     assert!(err.contains("already running"), "{err}");
     let mut other = bbs.spawn(&["--token", &tb, "read", "--wait"]);
+    bbs.ok(&["send", "--to", &a, "for the first waiter"]);
 
     let status = wait_exit(&mut first, 5).expect("first waiter did not wake");
     assert!(status.success());
@@ -834,9 +867,8 @@ fn only_one_read_wait_per_inbox() {
     );
 }
 
-#[test]
-fn read_wait_fails_if_retired_while_waiting() {
-    let bbs = Bbs::new("wait-retired");
+fn read_wait_fails_if_retired_while_waiting(mode: Mode) {
+    let bbs = Bbs::with_mode("wait-retired", mode);
     let (_a, ta) = bbs.register();
     let mut child = bbs.spawn(&["--token", &ta, "read", "--wait"]);
     std::thread::sleep(std::time::Duration::from_millis(500));
@@ -892,9 +924,29 @@ fn old_schema_is_migrated_on_open_even_concurrently() {
     std::fs::remove_dir_all(&home).unwrap();
 }
 
-#[test]
-fn view_is_for_humans_only() {
-    let bbs = Bbs::new("view");
+fn view_is_for_humans_only(mode: Mode) {
+    let bbs = Bbs::with_mode("view", mode);
     let (_a, ta) = bbs.register();
     assert!(bbs.err(&["--token", &ta, "view"]).contains("humans only"));
 }
+
+both_modes!(
+    init_is_idempotent,
+    direct_messages_within_group,
+    humans_message_agents_and_humans_but_agents_cannot_dm_humans,
+    broadcast_reaches_members_and_humans,
+    bye_retires_token_and_name,
+    stale_agents_are_retired_on_register,
+    human_name_is_reserved_and_permissions_enforced,
+    whoami_reports_agent_or_human,
+    humans_remove_agents_from_groups,
+    leaving_or_removal_notifies_the_group,
+    agents_lists_status_and_scopes_visibility,
+    active_at_writes_are_debounced,
+    claude_code_hooks_bind_and_deliver,
+    codex_hooks_bind_from_string_tool_response,
+    read_wait_blocks_until_mail_arrives,
+    only_one_read_wait_per_inbox,
+    read_wait_fails_if_retired_while_waiting,
+    view_is_for_humans_only,
+);
