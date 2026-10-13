@@ -3,6 +3,7 @@ mod cli;
 mod db;
 mod hook;
 mod names;
+mod proto;
 mod view;
 
 use std::fs::OpenOptions;
