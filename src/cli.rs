@@ -77,6 +77,15 @@ pub enum Command {
         #[arg(value_enum)]
         harness: Harness,
     },
+    /// Serve the BBS over gRPC, owning the database in the state directory.
+    Serve {
+        /// Address to listen on.
+        #[arg(long, default_value = "127.0.0.1:7777")]
+        listen: std::net::SocketAddr,
+        /// Directory holding bbs.db (default: ~/.local/state/bbs).
+        #[arg(long)]
+        state_dir: Option<std::path::PathBuf>,
+    },
     /// Print the caller's name: the agent owning --token, else the human.
     Whoami,
     /// List known agents and humans with their last activity.

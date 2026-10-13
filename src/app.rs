@@ -37,6 +37,9 @@ pub fn run(cli: Cli) -> Result<()> {
     match &cli.command {
         Command::Init { human } => return init(&dir, &db_path, human.as_deref()),
         Command::Hook { harness } => return crate::hook::run(*harness, &db_path),
+        Command::Serve { listen, state_dir } => {
+            return crate::serve::run(*listen, state_dir.as_deref().unwrap_or(&dir));
+        }
         _ => {}
     }
     if !db_path.exists() {
@@ -142,7 +145,9 @@ fn wait_for_unread(conn: &mut Connection, caller: &Caller, me: &db::Principal) -
 
 fn dispatch(conn: &mut Connection, caller: &Caller, command: Command) -> Result<String> {
     Ok(match command {
-        Command::Init { .. } | Command::Hook { .. } | Command::View => unreachable!(),
+        Command::Init { .. } | Command::Hook { .. } | Command::Serve { .. } | Command::View => {
+            unreachable!()
+        }
         Command::Human {
             command: HumanCommand::Add { name },
         } => {

@@ -4,6 +4,7 @@ mod db;
 mod hook;
 mod names;
 mod proto;
+mod serve;
 mod service;
 mod view;
 
