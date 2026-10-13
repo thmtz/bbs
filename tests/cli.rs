@@ -396,7 +396,8 @@ fn broadcast_reaches_members_and_humans(mode: Mode) {
         bbs.ok(&["--token", &tb, "read"])
             .contains(&format!("from {a} to @acme:\nstandup"))
     );
-    assert_eq!(bbs.ok(&["--token", &ta, "read"]), "");
+    // A has only B's join notice, not its own broadcast.
+    assert!(!bbs.ok(&["--token", &ta, "read"]).contains("standup"));
     assert_eq!(bbs.ok(&["--token", &tc, "read"]), "");
     assert!(bbs.ok(&["--as", "alice", "read"]).contains("standup"));
 
@@ -525,6 +526,28 @@ fn humans_remove_agents_from_groups(mode: Mode) {
         bbs.err(&["group", "remove", "nope", &b])
             .contains("no such group")
     );
+}
+
+fn joining_notifies_the_group(mode: Mode) {
+    let bbs = Bbs::with_mode("join", mode);
+    bbs.ok(&["group", "register", "g"]);
+    let (_a, ta) = bbs.register();
+    let (b, tb) = bbs.register();
+    bbs.ok(&["--token", &ta, "group", "join", "g"]);
+    bbs.ok(&["--token", &tb, "group", "join", "g"]);
+
+    let joined = format!("from {b} to @g:\n{b} joined @g.\n");
+    assert!(bbs.ok(&["--token", &ta, "read"]).contains(&joined));
+    assert!(bbs.ok(&["read"]).contains(&joined));
+    assert_eq!(bbs.ok(&["--token", &tb, "read"]), "");
+
+    // Re-joining is a no-op and announces nothing.
+    assert!(
+        bbs.ok(&["--token", &tb, "group", "join", "g"])
+            .contains("Already in @g.")
+    );
+    assert_eq!(bbs.ok(&["--token", &ta, "read"]), "");
+    assert_eq!(bbs.ok(&["read"]), "");
 }
 
 fn leaving_or_removal_notifies_the_group(mode: Mode) {
@@ -940,6 +963,7 @@ both_modes!(
     human_name_is_reserved_and_permissions_enforced,
     whoami_reports_agent_or_human,
     humans_remove_agents_from_groups,
+    joining_notifies_the_group,
     leaving_or_removal_notifies_the_group,
     agents_lists_status_and_scopes_visibility,
     active_at_writes_are_debounced,

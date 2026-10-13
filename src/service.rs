@@ -350,6 +350,7 @@ pub fn group_join(
         let gid = require_group(ctx.conn, group)?;
         let joined = db::join_group(ctx.conn, gid, me.id, &ctx.now_s)?;
         if joined {
+            broadcast(ctx, &me, gid, &format!("{} joined @{group}.", me.name))?;
             tracing::info!(agent = me.name, group, "joined group");
         }
         Ok(proto::GroupJoinResponse {
