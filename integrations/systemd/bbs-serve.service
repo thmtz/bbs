@@ -1,0 +1,15 @@
+# User unit for `bbs serve`. Install with:
+#   cp integrations/systemd/bbs-serve.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now bbs-serve
+# Set --listen to this machine's tailscale IP (`tailscale ip -4`).
+[Unit]
+Description=bbs message board server
+
+[Service]
+ExecStart=%h/.cargo/bin/bbs serve --listen 100.64.0.1:7777
+# Also covers starting before tailscale is up, when the address cannot be bound yet.
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
