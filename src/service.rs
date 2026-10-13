@@ -303,6 +303,15 @@ pub fn set_status(
 pub fn bye(conn: &mut Connection, caller: &Caller) -> Result<proto::ByeResponse> {
     with_ctx(conn, caller, |ctx| {
         let me = ctx.agent()?;
+        // Announce before retiring: retirement drops the memberships.
+        for (gid, group) in db::member_groups(ctx.conn, me.id)? {
+            broadcast(
+                ctx,
+                &me,
+                gid,
+                &format!("{} retired and left @{group}.", me.name),
+            )?;
+        }
         db::retire_agent(ctx.conn, me.id, &ctx.now_s)?;
         tracing::info!(agent = me.name, "agent retired");
         Ok(proto::ByeResponse { name: me.name })

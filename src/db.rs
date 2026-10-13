@@ -420,6 +420,18 @@ pub fn group_member_ids(conn: &Connection, group_id: i64) -> Result<Vec<i64>> {
     Ok(ids)
 }
 
+/// (group id, group name) for every group `agent_id` belongs to.
+pub fn member_groups(conn: &Connection, agent_id: i64) -> Result<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT g.id, g.name FROM group_members m JOIN bbs_groups g ON g.id = m.group_id
+         WHERE m.agent_id = ?1 ORDER BY g.name",
+    )?;
+    let groups = stmt
+        .query_map(params![agent_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    Ok(groups)
+}
+
 /// (group name, member names) for every group, or only those `agent_id` belongs to.
 pub fn list_groups(conn: &Connection, agent_id: Option<i64>) -> Result<Vec<(String, Vec<String>)>> {
     let mut stmt = conn.prepare(

@@ -423,6 +423,44 @@ fn bye_retires_token_and_name(mode: Mode) {
     assert!(bbs.ok(&["agents", "--all"]).contains("retired"));
 }
 
+fn bye_notifies_and_leaves_groups(mode: Mode) {
+    let bbs = Bbs::with_mode("bye-groups", mode);
+    bbs.ok(&["group", "register", "g"]);
+    bbs.ok(&["group", "register", "h"]);
+    let (a, ta) = bbs.register();
+    let (b, tb) = bbs.register();
+    let (c, tc) = bbs.register();
+    for g in ["g", "h"] {
+        bbs.ok(&["--token", &ta, "group", "join", g]);
+    }
+    bbs.ok(&["--token", &tb, "group", "join", "g"]);
+    bbs.ok(&["--token", &tc, "group", "join", "h"]);
+    for t in [&tb, &tc] {
+        bbs.ok(&["--token", t, "read"]);
+    }
+    bbs.ok(&["read"]);
+
+    bbs.ok(&["--token", &ta, "bye"]);
+    let from_g = format!("from {a} to @g:\n{a} retired and left @g.\n");
+    let from_h = format!("from {a} to @h:\n{a} retired and left @h.\n");
+    let mail_b = bbs.ok(&["--token", &tb, "read"]);
+    assert!(
+        mail_b.contains(&from_g) && !mail_b.contains("@h"),
+        "{mail_b}"
+    );
+    let mail_c = bbs.ok(&["--token", &tc, "read"]);
+    assert!(
+        mail_c.contains(&from_h) && !mail_c.contains("@g"),
+        "{mail_c}"
+    );
+    let human = bbs.ok(&["read"]);
+    assert!(
+        human.contains(&from_g) && human.contains(&from_h),
+        "{human}"
+    );
+    assert_eq!(bbs.ok(&["group", "list"]), format!("@g: {b}\n@h: {c}\n"));
+}
+
 fn stale_agents_are_retired_on_register(mode: Mode) {
     let bbs = Bbs::with_mode("stale", mode);
     let (a, ta) = bbs.register();
@@ -959,6 +997,7 @@ both_modes!(
     humans_message_agents_and_humans_but_agents_cannot_dm_humans,
     broadcast_reaches_members_and_humans,
     bye_retires_token_and_name,
+    bye_notifies_and_leaves_groups,
     stale_agents_are_retired_on_register,
     human_name_is_reserved_and_permissions_enforced,
     whoami_reports_agent_or_human,
