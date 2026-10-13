@@ -28,14 +28,11 @@ const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// A waiting agent is alive; keep it clear of stale-agent retirement.
 const WAIT_TOUCH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
-pub fn run(listen: SocketAddr, dir: &Path) -> Result<()> {
+pub async fn run(listen: SocketAddr, dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let mut conn = db::open(&dir.join("bbs.db"))?;
     db::migrate(&mut conn)?;
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(serve(conn, listen))
+    serve(conn, listen).await
 }
 
 async fn serve(conn: Connection, listen: SocketAddr) -> Result<()> {

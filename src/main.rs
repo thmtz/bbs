@@ -1,4 +1,5 @@
 mod app;
+mod backend;
 mod cli;
 mod config;
 mod db;
@@ -34,10 +35,11 @@ fn init_logging() {
         .init();
 }
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     init_logging();
     let cli = cli::Cli::parse();
-    match app::run(cli) {
+    match app::run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             tracing::error!("{err:#}");

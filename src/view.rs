@@ -11,37 +11,29 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
-use rusqlite::Connection;
 
-use crate::db;
-use crate::proto::{FeedRequest, Kind, Message};
-use crate::service::{self, Caller};
+use crate::backend::Backend;
+use crate::proto::{Kind, Message};
 
 const BACKLOG: u32 = 200;
 const DB_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const KEY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-pub fn run(conn: &mut Connection, caller: &Caller) -> Result<()> {
+pub async fn run(backend: &mut Backend) -> Result<()> {
     // Fetch before taking over the terminal, so a refusal prints normally.
-    let rows = feed(conn, caller)?;
+    let rows = backend.feed(BACKLOG).await?;
     let mut terminal = ratatui::init();
-    let result = feed_loop(&mut terminal, conn, caller, rows);
+    let result = feed_loop(&mut terminal, backend, rows).await;
     ratatui::restore();
     result
 }
 
-fn feed(conn: &mut Connection, caller: &Caller) -> Result<Vec<Message>> {
-    let req = FeedRequest { backlog: BACKLOG };
-    Ok(service::feed(conn, caller, req)?.messages)
-}
-
-fn feed_loop(
+async fn feed_loop(
     terminal: &mut DefaultTerminal,
-    conn: &mut Connection,
-    caller: &Caller,
+    backend: &mut Backend,
     mut rows: Vec<Message>,
 ) -> Result<()> {
-    let mut seen_version = db::data_version(conn)?;
+    let mut seen_version = backend.change_marker()?;
     let mut last_poll = Instant::now();
     let mut dirty = true;
     loop {
@@ -62,15 +54,17 @@ fn feed_loop(
                 _ => {}
             }
         }
-        // data_version changes only when another connection commits, so the
-        // feed is re-queried only after new messages or reads.
+        // Locally, data_version changes only when another connection commits,
+        // so the feed is re-queried only after new messages or reads. A server
+        // gives no marker, so its feed is re-fetched every poll.
         if last_poll.elapsed() >= DB_POLL_INTERVAL {
             last_poll = Instant::now();
-            let version = db::data_version(conn)?;
-            if version != seen_version {
+            let version = backend.change_marker()?;
+            if version.is_none() || version != seen_version {
                 seen_version = version;
-                rows = feed(conn, caller)?;
-                dirty = true;
+                let fresh = backend.feed(BACKLOG).await?;
+                dirty |= fresh != rows;
+                rows = fresh;
             }
         }
     }

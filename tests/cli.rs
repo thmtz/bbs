@@ -144,18 +144,16 @@ fn init_writes_and_merges_config() {
     );
     bbs.ok(&["send", "--to", name, "hello"]);
 
-    let out = bbs.ok(&["init", "--server", "bbs.example:7777"]);
-    assert_eq!(out, "BBS configured for server bbs.example:7777\n");
-    bbs.ok(&["init", "--human", "ada"]);
+    // Nothing listens on port 1: init saves the config, then fails to reach it.
+    let down = "connecting to bbs server at 127.0.0.1:1";
+    assert!(bbs.err(&["init", "--server", "127.0.0.1:1"]).contains(down));
+    assert!(bbs.err(&["init", "--human", "ada"]).contains(down));
     let config = std::fs::read_to_string(config_path(&bbs)).unwrap();
-    assert!(config.contains("server = \"bbs.example:7777\""), "{config}");
+    assert!(config.contains("server = \"127.0.0.1:1\""), "{config}");
     assert!(config.contains("human = \"ada\""), "{config}");
 
-    // With a server configured, commands refuse and hooks stay silent.
-    assert!(
-        bbs.err(&["whoami"])
-            .contains("remote mode is not implemented yet")
-    );
+    // Commands use the configured server; hooks stay silent when it is down.
+    assert!(bbs.err(&["whoami"]).contains(down));
     let stop = serde_json::json!({"session_id": "s1", "hook_event_name": "Stop"});
     assert_eq!(hook(&bbs, stop.clone()), None);
     std::fs::remove_file(config_path(&bbs)).unwrap();
@@ -179,8 +177,101 @@ fn bbs_server_env_overrides_config() {
     let bbs = Bbs::new("server-env");
     let out = bbs.run_with_env(&["whoami"], "", &[("BBS_SERVER", "127.0.0.1:1")]);
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("remote mode is not implemented yet"));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("connecting to bbs server at 127.0.0.1:1")
+    );
     assert!(!config_path(&bbs).exists());
+}
+
+/// A `bbs serve` process on a loopback port, with its own state directory.
+struct Server {
+    child: std::process::Child,
+    addr: String,
+}
+
+impl Server {
+    fn start(bbs: &Bbs) -> Server {
+        let state = bbs.home.join("server");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_bbs"))
+            .args(["serve", "--listen", "127.0.0.1:0", "--state-dir"])
+            .arg(&state)
+            .env("HOME", &bbs.home)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.take().unwrap()),
+            &mut line,
+        )
+        .unwrap();
+        let addr = line.trim().rsplit(' ').next().unwrap().to_string();
+        Server { child, addr }
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn remote_backend_round_trip() {
+    let bbs = Bbs::new("remote");
+    let server = Server::start(&bbs);
+    let out = bbs.ok(&["init", "--server", &server.addr]);
+    assert!(out.contains("Human: will"), "{out}");
+
+    bbs.ok(&["group", "register", "acme"]);
+    let register_out = bbs.ok(&["register"]);
+    let (a, ta) = bbs.register();
+    let b = register_out.split('"').nth(1).unwrap();
+    bbs.ok(&["--token", &ta, "group", "join", "acme"]);
+    assert!(
+        bbs.err(&["--token", &ta, "send", "--to", "will", "hi"])
+            .contains("cannot message humans")
+    );
+    bbs.ok(&["--token", &ta, "send", "--to", "@acme", "standup"]);
+    assert!(bbs.ok(&["read"]).contains("standup"));
+    assert_eq!(bbs.ok(&["whoami"]), "will\n");
+
+    // Hooks bind and deliver through the server.
+    let post_tool = serde_json::json!({
+        "session_id": "s1",
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": "bbs register" },
+        "tool_response": { "stdout": register_out, "stderr": "" },
+    });
+    assert!(hook(&bbs, post_tool).is_none());
+    bbs.ok(&["send", "--to", b, "from will"]);
+    let stop = serde_json::json!({"session_id": "s1", "hook_event_name": "Stop"});
+    let out = hook(&bbs, stop).unwrap();
+    assert!(
+        out["reason"].as_str().unwrap().contains("from will"),
+        "{out}"
+    );
+
+    // `read --wait` blocks on the server until mail arrives.
+    let mut waiter = bbs.spawn(&["--token", &ta, "read", "--wait"]);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        bbs.err(&["--token", &ta, "read", "--wait"])
+            .contains("already running")
+    );
+    bbs.ok(&["send", "--to", &a, "wake up"]);
+    assert!(wait_exit(&mut waiter, 5).unwrap().success());
+    let out = waiter.wait_with_output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("wake up"));
+
+    // Everything went to the server, not the database from the local `init`.
+    let local_agents: i64 = bbs
+        .db()
+        .query_row("SELECT COUNT(*) FROM agents", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(local_agents, 0);
 }
 
 #[test]
