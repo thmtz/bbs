@@ -32,17 +32,17 @@ pub async fn run(listen: SocketAddr, dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let mut conn = db::open(&dir.join("bbs.db"))?;
     db::migrate(&mut conn)?;
-    serve(conn, listen).await
+    serve(conn, listen, dir).await
 }
 
-async fn serve(conn: Connection, listen: SocketAddr) -> Result<()> {
+async fn serve(conn: Connection, listen: SocketAddr, dir: &Path) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("binding {listen}"))?;
     let addr = listener.local_addr()?;
     // Tests read this line to learn the port when listening on port 0.
     println!("bbs serve listening on {addr}");
-    tracing::info!(%addr, "serving");
+    tracing::info!(%addr, state_dir = %dir.display(), "serving");
     let state = Arc::new(State {
         conn: Mutex::new(conn),
         notify: watch::Sender::new(0),
@@ -85,6 +85,24 @@ impl State {
         out.map_err(|err| Status::failed_precondition(format!("{err:#}")))
     }
 
+    /// Log a failed RPC with the caller's name. Tokens are credentials, so an
+    /// agent is logged by name, or as unknown if its token resolves to no one.
+    async fn warn_failed(self: &Arc<Self>, rpc: &str, caller: &Caller, status: &Status) {
+        let who = match (&caller.token, &caller.human) {
+            (Some(token), _) => {
+                let token = token.trim().to_ascii_lowercase();
+                self.call(move |conn| db::agent_by_token(conn, &token))
+                    .await
+                    .ok()
+                    .flatten()
+                    .map_or_else(|| "<unknown token>".to_string(), |agent| agent.name)
+            }
+            (None, Some(human)) => human.clone(),
+            (None, None) => "-".to_string(),
+        };
+        tracing::warn!(rpc, caller = who, "rpc failed: {}", status.message());
+    }
+
     fn changed(&self) {
         self.notify.send_modify(|v| *v += 1);
     }
@@ -92,12 +110,11 @@ impl State {
     /// Wait for unread mail, then stream it as `Read` would take it.
     async fn wait(
         self: &Arc<Self>,
-        caller: Caller,
+        caller: Arc<Caller>,
         me: proto::Principal,
         limit: Option<u32>,
         tx: &mpsc::Sender<Result<proto::Message, Status>>,
     ) -> Result<(), Status> {
-        let caller = Arc::new(caller);
         let mut changes = self.notify.subscribe();
         let mut touch =
             tokio::time::interval_at(Instant::now() + WAIT_TOUCH_INTERVAL, WAIT_TOUCH_INTERVAL);
@@ -198,6 +215,7 @@ enum Effect {
 impl Server {
     async fn unary<Req, T, F>(
         &self,
+        rpc: &str,
         req: Request<Req>,
         effect: Effect,
         f: F,
@@ -207,9 +225,16 @@ impl Server {
         T: Send + 'static,
         F: FnOnce(&mut Connection, &Caller, Req) -> Result<T> + Send + 'static,
     {
-        let caller = caller(&req);
+        let caller = Arc::new(caller(&req));
         let req = req.into_inner();
-        let out = self.0.call(move |conn| f(conn, &caller, req)).await?;
+        let c = caller.clone();
+        let out = match self.0.call(move |conn| f(conn, &c, req)).await {
+            Ok(out) => out,
+            Err(status) => {
+                self.0.warn_failed(rpc, &caller, &status).await;
+                return Err(status);
+            }
+        };
         if effect == Effect::Write {
             self.0.changed();
         }
@@ -225,29 +250,33 @@ impl Bbs for Server {
         &self,
         req: Request<proto::EnsureHumanRequest>,
     ) -> Result<Response<proto::EnsureHumanResponse>, Status> {
-        self.unary(req, Effect::Write, |c, _, r| service::ensure_human(c, r))
-            .await
+        self.unary("ensure_human", req, Effect::Write, |c, _, r| {
+            service::ensure_human(c, r)
+        })
+        .await
     }
 
     async fn add_human(
         &self,
         req: Request<proto::AddHumanRequest>,
     ) -> Result<Response<proto::Empty>, Status> {
-        self.unary(req, Effect::Write, service::add_human).await
+        self.unary("add_human", req, Effect::Write, service::add_human)
+            .await
     }
 
     async fn register(
         &self,
         req: Request<proto::RegisterRequest>,
     ) -> Result<Response<proto::RegisterResponse>, Status> {
-        self.unary(req, Effect::Write, service::register).await
+        self.unary("register", req, Effect::Write, service::register)
+            .await
     }
 
     async fn whoami(
         &self,
         req: Request<proto::Empty>,
     ) -> Result<Response<proto::Principal>, Status> {
-        self.unary(req, Effect::Query, |c, caller, _| {
+        self.unary("whoami", req, Effect::Query, |c, caller, _| {
             service::whoami(c, caller)
         })
         .await
@@ -257,51 +286,62 @@ impl Bbs for Server {
         &self,
         req: Request<proto::SetStatusRequest>,
     ) -> Result<Response<proto::Empty>, Status> {
-        self.unary(req, Effect::Write, service::set_status).await
+        self.unary("set_status", req, Effect::Write, service::set_status)
+            .await
     }
 
     async fn bye(
         &self,
         req: Request<proto::Empty>,
     ) -> Result<Response<proto::ByeResponse>, Status> {
-        self.unary(req, Effect::Write, |c, caller, _| service::bye(c, caller))
-            .await
+        self.unary("bye", req, Effect::Write, |c, caller, _| {
+            service::bye(c, caller)
+        })
+        .await
     }
 
     async fn group_register(
         &self,
         req: Request<proto::GroupRequest>,
     ) -> Result<Response<proto::GroupResponse>, Status> {
-        self.unary(req, Effect::Write, service::group_register)
-            .await
+        self.unary(
+            "group_register",
+            req,
+            Effect::Write,
+            service::group_register,
+        )
+        .await
     }
 
     async fn group_join(
         &self,
         req: Request<proto::GroupRequest>,
     ) -> Result<Response<proto::GroupJoinResponse>, Status> {
-        self.unary(req, Effect::Write, service::group_join).await
+        self.unary("group_join", req, Effect::Write, service::group_join)
+            .await
     }
 
     async fn group_leave(
         &self,
         req: Request<proto::GroupRequest>,
     ) -> Result<Response<proto::GroupResponse>, Status> {
-        self.unary(req, Effect::Write, service::group_leave).await
+        self.unary("group_leave", req, Effect::Write, service::group_leave)
+            .await
     }
 
     async fn group_remove(
         &self,
         req: Request<proto::GroupRemoveRequest>,
     ) -> Result<Response<proto::GroupRemoveResponse>, Status> {
-        self.unary(req, Effect::Write, service::group_remove).await
+        self.unary("group_remove", req, Effect::Write, service::group_remove)
+            .await
     }
 
     async fn group_list(
         &self,
         req: Request<proto::Empty>,
     ) -> Result<Response<proto::GroupListResponse>, Status> {
-        self.unary(req, Effect::Query, |c, caller, _| {
+        self.unary("group_list", req, Effect::Query, |c, caller, _| {
             service::group_list(c, caller)
         })
         .await
@@ -311,14 +351,16 @@ impl Bbs for Server {
         &self,
         req: Request<proto::SendRequest>,
     ) -> Result<Response<proto::SendResponse>, Status> {
-        self.unary(req, Effect::Write, service::send).await
+        self.unary("send", req, Effect::Write, service::send).await
     }
 
     async fn read(
         &self,
         req: Request<proto::ReadRequest>,
     ) -> Result<Response<proto::ReadResponse>, Status> {
-        let resp = self.unary(req, Effect::Query, service::read).await?;
+        let resp = self
+            .unary("read", req, Effect::Query, service::read)
+            .await?;
         // Taking mail sets read_at, which the feed shows.
         if !resp.get_ref().messages.is_empty() {
             self.0.changed();
@@ -335,14 +377,26 @@ impl Bbs for Server {
         let caller = caller(&req);
         let limit = req.into_inner().limit;
         let c = caller.clone();
-        let me = self.0.call(move |conn| service::whoami(conn, &c)).await?;
-        // Claim before returning, so a second waiter fails immediately.
-        let slot = Slot::claim(&self.0, &me)?;
+        let claim = async {
+            let me = self.0.call(move |conn| service::whoami(conn, &c)).await?;
+            // Claim before returning, so a second waiter fails immediately.
+            let slot = Slot::claim(&self.0, &me)?;
+            Ok::<_, Status>((me, slot))
+        };
+        let (me, slot) = match claim.await {
+            Ok(claimed) => claimed,
+            Err(status) => {
+                self.0.warn_failed("wait_for_mail", &caller, &status).await;
+                return Err(status);
+            }
+        };
         let (tx, rx) = mpsc::channel(16);
         let state = self.0.clone();
         tokio::spawn(async move {
             let _slot = slot;
-            if let Err(status) = state.wait(caller, me, limit, &tx).await {
+            let caller = Arc::new(caller);
+            if let Err(status) = state.wait(caller.clone(), me, limit, &tx).await {
+                state.warn_failed("wait_for_mail", &caller, &status).await;
                 let _ = tx.send(Err(status)).await;
             }
         });
@@ -353,7 +407,8 @@ impl Bbs for Server {
         &self,
         req: Request<proto::ListAgentsRequest>,
     ) -> Result<Response<proto::ListAgentsResponse>, Status> {
-        self.unary(req, Effect::Query, service::list_agents).await
+        self.unary("list_agents", req, Effect::Query, service::list_agents)
+            .await
     }
 
     type WatchFeedStream = BoxStream<proto::FeedSnapshot>;
@@ -368,11 +423,20 @@ impl Bbs for Server {
         let mut changes = state.notify.subscribe();
         // The first snapshot also checks the caller is a human, before the stream opens.
         let c = caller.clone();
-        let first = state.call(move |conn| service::feed(conn, &c, req)).await?;
+        let first = match state.call(move |conn| service::feed(conn, &c, req)).await {
+            Ok(first) => first,
+            Err(status) => {
+                state.warn_failed("watch_feed", &caller, &status).await;
+                return Err(status);
+            }
+        };
         let (tx, rx) = mpsc::channel(4);
         tokio::spawn(async move {
             let mut snapshot = Ok(first);
             loop {
+                if let Err(status) = &snapshot {
+                    state.warn_failed("watch_feed", &caller, status).await;
+                }
                 let failed = snapshot.is_err();
                 if tx.send(snapshot).await.is_err() || failed {
                     return;
@@ -393,15 +457,19 @@ impl Bbs for Server {
         &self,
         req: Request<proto::BindSessionRequest>,
     ) -> Result<Response<proto::BindSessionResponse>, Status> {
-        self.unary(req, Effect::Write, |c, _, r| service::bind_session(c, r))
-            .await
+        self.unary("bind_session", req, Effect::Write, |c, _, r| {
+            service::bind_session(c, r)
+        })
+        .await
     }
 
     async fn session_agent(
         &self,
         req: Request<proto::SessionAgentRequest>,
     ) -> Result<Response<proto::SessionAgentResponse>, Status> {
-        self.unary(req, Effect::Query, |c, _, r| service::session_agent(c, r))
-            .await
+        self.unary("session_agent", req, Effect::Query, |c, _, r| {
+            service::session_agent(c, r)
+        })
+        .await
     }
 }
