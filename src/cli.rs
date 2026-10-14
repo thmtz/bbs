@@ -43,6 +43,9 @@ pub enum Command {
     },
     /// Register a new agent and print its name and token.
     Register {
+        /// Requested agent name; fail if already reserved (case-insensitive).
+        #[arg(long)]
+        name: Option<String>,
         /// Initial status note.
         #[arg(long)]
         note: Option<String>,

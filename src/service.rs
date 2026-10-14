@@ -128,6 +128,8 @@ fn message(m: db::MessageView, reader: Option<&str>) -> proto::Message {
         created_at: m.created_at,
         from_kind: proto_kind(m.from_kind).into(),
         from_name: m.from_name,
+        from_owner: m.from_owner,
+        reader_owner: m.reader_owner,
         to_group: m.to_group,
         to_name,
         read_at: m.read_at,
@@ -135,7 +137,7 @@ fn message(m: db::MessageView, reader: Option<&str>) -> proto::Message {
     }
 }
 
-fn validate_human_name(name: &str) -> Result<()> {
+fn validate_principal_name(name: &str, kind: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.len() <= 64
         && name.starts_with(|c: char| c.is_ascii_alphanumeric())
@@ -143,7 +145,9 @@ fn validate_human_name(name: &str) -> Result<()> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
     if !ok {
-        bail!("invalid human name {name:?}: use letters, digits, '.', '_' or '-'");
+        bail!(
+            "invalid {kind} name {name:?}: use 1-64 letters, digits, '.', '_' or '-', starting with a letter or digit"
+        );
     }
     Ok(())
 }
@@ -172,7 +176,7 @@ fn validate_body(body: &str) -> Result<()> {
 }
 
 fn insert_human(ctx: &Ctx, name: &str) -> Result<()> {
-    validate_human_name(name)?;
+    validate_principal_name(name, "human")?;
     if db::find_human(ctx.conn, name)?.is_some() {
         bail!("human {name:?} already exists");
     }
@@ -255,18 +259,31 @@ pub fn register(
         if ctx.caller.token.is_some() {
             bail!("already registered; `bbs bye` first to register again");
         }
+        let owner = ctx.human()?;
+        if let Some(name) = &req.name {
+            validate_principal_name(name, "agent")?;
+        }
         let cutoff = fmt_time(ctx.now - chrono::Duration::days(RETIRE_AFTER_DAYS));
         for id in db::stale_agent_ids(ctx.conn, &cutoff)? {
             db::retire_agent(ctx.conn, id, &ctx.now_s)?;
             tracing::info!(agent_id = id, "retired stale agent");
         }
-        let name = pick_name(ctx.conn)?;
+        let name = match req.name {
+            Some(name) => {
+                if db::taken_names(ctx.conn)?.contains(&name.to_ascii_lowercase()) {
+                    bail!("agent name {name:?} is already reserved");
+                }
+                name
+            }
+            None => pick_name(ctx.conn)?,
+        };
         let token = new_token(ctx.conn)?;
         let id = db::insert_agent(
             ctx.conn,
             &db::NewAgent {
                 name: &name,
                 token: &token,
+                owner_id: owner.id,
                 status: req.note.as_deref(),
                 pwd: &req.pwd,
                 hostname: &req.hostname,
@@ -630,6 +647,7 @@ pub fn list_agents(
                 hostname: a.hostname,
                 active_at: a.active_at,
                 retired: a.retired_at.is_some(),
+                owner: a.owner,
             })
             .collect();
         Ok(proto::ListAgentsResponse { humans, agents })
