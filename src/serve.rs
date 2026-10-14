@@ -455,7 +455,9 @@ impl Bbs for Server {
             let _slot = slot;
             let caller = Arc::new(caller);
             tokio::select! {
-                _ = state.stopping() => {},
+                _ = state.stopping() => {
+                    let _ = tx.send(Err(Status::unavailable("server is shutting down"))).await;
+                },
                 _ = async {
                     if let Err(status) = state.wait(caller.clone(), me, limit, &tx).await {
                         state.warn_failed("wait_for_mail", &caller, &status).await;
@@ -516,7 +518,9 @@ impl Bbs for Server {
                 }
             };
             tokio::select! {
-                _ = state.stopping() => {},
+                _ = state.stopping() => {
+                    let _ = tx.send(Err(Status::unavailable("server is shutting down"))).await;
+                },
                 _ = send_snapshots => {},
             }
         });

@@ -360,8 +360,14 @@ async fn termination_closes_mail_and_feed_streams() {
         feed.message().await.unwrap().unwrap();
         signal(&server, name);
         expect_clean_exit(&mut server, Duration::from_secs(3)).await;
-        assert!(mail.message().await.unwrap().is_none());
-        assert!(feed.message().await.unwrap().is_none());
+        assert_eq!(
+            mail.message().await.unwrap_err().code(),
+            tonic::Code::Unavailable
+        );
+        assert_eq!(
+            feed.message().await.unwrap_err().code(),
+            tonic::Code::Unavailable
+        );
         let db = rusqlite::Connection::open(server.home.join(".local/state/bbs/bbs.db")).unwrap();
         let integrity: String = db
             .query_row("PRAGMA integrity_check", [], |r| r.get(0))
