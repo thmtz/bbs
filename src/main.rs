@@ -2,6 +2,7 @@ mod admin;
 mod app;
 mod auth;
 mod backend;
+mod backup;
 mod cli;
 mod config;
 mod db;

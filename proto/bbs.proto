@@ -38,7 +38,8 @@ service Bbs {
   // Humans only. Emits the recent window at start and after every change.
   rpc WatchFeed(FeedRequest) returns (stream FeedSnapshot);
 
-  // Harness session binding (hooks). No caller; the token is in the request.
+  // Harness session binding (hooks). The agent token is in the request.
+  // Trust mode needs no caller metadata.
   // Required-token mode: human must own both the old and new session agent.
   rpc BindSession(BindSessionRequest) returns (BindSessionResponse);
   // Required-token mode: returns credentials only to the owning human.

@@ -36,6 +36,10 @@ pub async fn run(cli: Cli) -> Result<()> {
         | Command::Admin {
             state_dir: Some(dir),
             ..
+        }
+        | Command::Backup {
+            state_dir: Some(dir),
+            ..
         } => dir.clone(),
         _ => state_dir()?,
     };
@@ -68,6 +72,11 @@ pub async fn run(cli: Cli) -> Result<()> {
             .await;
         }
         Command::Admin { command, .. } => return crate::admin::run(&dir, command),
+        Command::Backup { destination, .. } => {
+            crate::backup::run(&dir, destination)?;
+            println!("Backup saved to {}", destination.display());
+            return Ok(());
+        }
         _ => {}
     }
     let config = Config::load()?;
@@ -98,6 +107,7 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
         | Command::Hook { .. }
         | Command::Serve { .. }
         | Command::Admin { .. }
+        | Command::Backup { .. }
         | Command::View => {
             unreachable!()
         }

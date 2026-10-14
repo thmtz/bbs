@@ -80,6 +80,35 @@ pub fn open(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Consistent online snapshot through SQLite's backup API, without modifying or
+/// migrating the source. Destination must be a new, private temporary file.
+pub fn backup(source: &Path, destination: &Path) -> Result<()> {
+    let source = Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("opening backup source {}", source.display()))?;
+    source.busy_timeout(Duration::from_secs(5))?;
+    // Pin a read snapshot so ongoing writes do not repeatedly restart the copy.
+    source.execute_batch("BEGIN")?;
+    let _: i64 = source.query_row("SELECT count(*) FROM sqlite_schema", [], |r| r.get(0))?;
+    let mut target = Connection::open(destination)?;
+    {
+        let backup = rusqlite::backup::Backup::new(&source, &mut target)?;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if matches!(backup.step(256)?, rusqlite::backup::StepResult::Done) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                bail!("backup did not finish within 60 seconds");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    // Publish a standalone database, without WAL or journal sidecars to copy.
+    target.pragma_update(None, "journal_mode", "DELETE")?;
+    target.close().map_err(|(_, error)| error)?;
+    Ok(())
+}
+
 /// WAL is persistent, so this normally just reads the mode. Switching needs an
 /// exclusive lock that the busy timeout does not cover, so retry while contended.
 fn enable_wal(conn: &Connection) -> Result<()> {
