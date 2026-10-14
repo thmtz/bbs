@@ -10,6 +10,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use rand::seq::IndexedRandom;
 use rusqlite::{Connection, TransactionBehavior};
 
+use crate::auth::{self, AuthenticationError};
 use crate::db;
 use crate::names::NAMES;
 use crate::proto;
@@ -20,15 +21,20 @@ pub const MAX_BODY_BYTES: usize = 64 * 1024;
 const ACTIVE_AT_DEBOUNCE: chrono::Duration = chrono::Duration::seconds(60);
 
 /// Who is calling: the agent owning `token`, else the human named `human`.
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct Caller {
     pub token: Option<String>,
     pub human: Option<String>,
+    pub human_token: Option<String>,
+    /// Set by the server, never accepted from client-supplied metadata.
+    pub require_human_token: bool,
 }
 
 const NO_CALLER: Caller = Caller {
     token: None,
     human: None,
+    human_token: None,
+    require_human_token: false,
 };
 
 pub fn fmt_time(t: DateTime<Utc>) -> String {
@@ -72,10 +78,44 @@ impl Ctx<'_> {
         if let Some(token) = &self.caller.token {
             let token = token.trim().to_ascii_lowercase();
             let Some(agent) = db::agent_by_token(self.conn, &token)? else {
-                bail!("unknown or retired token; run `bbs register`");
+                return Err(
+                    AuthenticationError("unknown or retired token; run `bbs register`").into(),
+                );
             };
+            if self.caller.require_human_token
+                && (!auth::is_strong_token(&token)
+                    || !db::agent_owner_enabled(self.conn, agent.id)?)
+            {
+                return Err(AuthenticationError(
+                    "agent credential is disabled or needs re-registration",
+                )
+                .into());
+            }
             db::touch_agent(self.conn, agent.id, &self.now_s, &self.touch_cutoff())?;
             return Ok(agent);
+        }
+        if let Some(token) = &self.caller.human_token {
+            let human = db::human_by_token_hash(self.conn, &auth::token_hash(token))?
+                .ok_or(AuthenticationError("invalid or revoked human token"))?;
+            if self
+                .caller
+                .human
+                .as_ref()
+                .is_some_and(|name| !name.eq_ignore_ascii_case(&human.name))
+            {
+                return Err(AuthenticationError(
+                    "claimed human does not match the authenticated human",
+                )
+                .into());
+            }
+            db::touch_human(self.conn, human.id, &self.now_s, &self.touch_cutoff())?;
+            return Ok(human);
+        }
+        if self.caller.require_human_token {
+            return Err(AuthenticationError(
+                "human token required; run `bbs init --server <address>`",
+            )
+            .into());
         }
         let Some(name) = &self.caller.human else {
             bail!("no caller identity; pass --token, or --as <human>");
@@ -240,10 +280,7 @@ fn pick_name(conn: &Connection) -> Result<String> {
 
 fn new_token(conn: &Connection) -> Result<String> {
     loop {
-        let bytes: [u8; 4] = rand::random();
-        let token = data_encoding::BASE32_NOPAD
-            .encode(&bytes)
-            .to_ascii_lowercase();
+        let token = auth::new_token();
         if !db::token_exists(conn, &token)? {
             return Ok(token);
         }
@@ -673,17 +710,55 @@ pub fn feed(
 
 // ---- harness sessions ------------------------------------------------------
 
+pub fn admin_issue_token(conn: &mut Connection, name: &str, create: bool) -> Result<String> {
+    with_ctx(conn, &NO_CALLER, |ctx| {
+        if create {
+            insert_human(ctx, name)?;
+        }
+        let human =
+            db::find_human(ctx.conn, name)?.with_context(|| format!("unknown human {name:?}"))?;
+        let token = auth::new_token();
+        db::set_human_token(ctx.conn, human.id, &auth::token_hash(&token))?;
+        Ok(token)
+    })
+}
+
+pub fn admin_revoke_token(conn: &mut Connection, name: &str) -> Result<()> {
+    with_ctx(conn, &NO_CALLER, |ctx| {
+        let human =
+            db::find_human(ctx.conn, name)?.with_context(|| format!("unknown human {name:?}"))?;
+        db::revoke_human_token(ctx.conn, human.id)
+    })
+}
+
 /// Bind a harness session to the agent owning `token`. A session holds one
 /// identity, so an agent it was previously bound to is retired. An unknown
 /// token binds nothing and returns no agent.
 pub fn bind_session(
     conn: &mut Connection,
+    caller: &Caller,
     req: proto::BindSessionRequest,
 ) -> Result<proto::BindSessionResponse> {
-    with_ctx(conn, &NO_CALLER, |ctx| {
+    with_ctx(conn, caller, |ctx| {
+        let human = caller
+            .require_human_token
+            .then(|| ctx.human())
+            .transpose()?;
         let Some(agent) = db::agent_by_token(ctx.conn, &req.token)? else {
             return Ok(proto::BindSessionResponse { agent: None });
         };
+        if let Some(human) = human {
+            if db::agent_owner_id(ctx.conn, agent.id)? != Some(human.id)
+                || !auth::is_strong_token(&req.token)
+            {
+                bail!("cannot bind an agent owned by another human or using a legacy token");
+            }
+            if let Some(previous) = db::session_binding(ctx.conn, &req.harness, &req.session_id)?
+                && db::agent_owner_id(ctx.conn, previous)? != Some(human.id)
+            {
+                bail!("session belongs to another human");
+            }
+        }
         let previous = db::bind_session(
             ctx.conn,
             &req.harness,
@@ -710,17 +785,27 @@ pub fn bind_session(
 /// The live agent bound to a harness session, with its token; both unset if unbound.
 pub fn session_agent(
     conn: &mut Connection,
+    caller: &Caller,
     req: proto::SessionAgentRequest,
 ) -> Result<proto::SessionAgentResponse> {
-    with_ctx(conn, &NO_CALLER, |ctx| {
-        Ok(
-            match db::session_agent(ctx.conn, &req.harness, &req.session_id)? {
-                Some((agent, token)) => proto::SessionAgentResponse {
-                    agent: Some(principal(agent)),
-                    token,
-                },
-                None => proto::SessionAgentResponse::default(),
-            },
-        )
+    with_ctx(conn, caller, |ctx| {
+        let human = caller
+            .require_human_token
+            .then(|| ctx.human())
+            .transpose()?;
+        let Some((agent, token)) = db::session_agent(ctx.conn, &req.harness, &req.session_id)?
+        else {
+            return Ok(proto::SessionAgentResponse::default());
+        };
+        if let Some(human) = human
+            && (db::agent_owner_id(ctx.conn, agent.id)? != Some(human.id)
+                || !auth::is_strong_token(&token))
+        {
+            return Ok(proto::SessionAgentResponse::default());
+        }
+        Ok(proto::SessionAgentResponse {
+            agent: Some(principal(agent)),
+            token,
+        })
     })
 }

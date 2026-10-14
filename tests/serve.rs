@@ -25,11 +25,19 @@ struct Server {
 
 impl Server {
     fn start(test: &str) -> Server {
+        Self::start_mode(test, false)
+    }
+
+    fn start_mode(test: &str, protected: bool) -> Server {
         let home = std::env::temp_dir().join(format!("bbs-serve-{}-{test}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_bbs"))
-            .args(["serve", "--listen", "127.0.0.1:0"])
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bbs"));
+        command.args(["serve", "--listen", "127.0.0.1:0"]);
+        if protected {
+            command.arg("--require-human-token");
+        }
+        let mut child = command
             .env("HOME", &home)
             .stdout(Stdio::piped())
             .spawn()
@@ -437,4 +445,401 @@ async fn health_watchers_cannot_prevent_shutdown() {
     // Keep the health stream alive: the server must enforce its drain deadline.
     expect_clean_exit(&mut server, Duration::from_secs(10)).await;
     drop(watch);
+}
+
+fn credential<T>(token: &str, msg: T) -> Request<T> {
+    let mut req = Request::new(msg);
+    req.metadata_mut()
+        .insert("bbs-human-token", token.parse().unwrap());
+    req
+}
+
+impl Server {
+    fn admin(&self, action: &str, name: &str) -> String {
+        let output = Command::new(env!("CARGO_BIN_EXE_bbs"))
+            .args(["admin", "human", action, name, "--state-dir"])
+            .arg(self.home.join(".local/state/bbs"))
+            .env_remove("HOME")
+            .env("BBS_SERVER", "invalid:1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+}
+
+async fn protected_register(
+    client: &mut BbsClient<Channel>,
+    token: &str,
+    name: &str,
+) -> proto::RegisterResponse {
+    client
+        .register(credential(
+            token,
+            proto::RegisterRequest {
+                name: Some(name.into()),
+                note: None,
+                pwd: "/tmp".into(),
+                hostname: "test".into(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+}
+
+#[tokio::test]
+async fn protected_identity_and_session_ownership() {
+    let server = Server::start_mode("protected-ownership", true);
+    let mut client = server.client().await;
+    assert!(
+        client
+            .server_info(proto::Empty {})
+            .await
+            .unwrap()
+            .into_inner()
+            .require_human_token
+    );
+    assert_eq!(
+        client
+            .ensure_human(proto::EnsureHumanRequest {
+                name: "outsider".into()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    assert_eq!(
+        client
+            .whoami(as_human("Ada", proto::Empty {}))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+    let ada = server.admin("add", "Ada");
+    let bob = server.admin("add", "Bob");
+    assert_eq!(ada.len(), 26);
+    assert_eq!(
+        client
+            .whoami(credential(&ada, proto::Empty {}))
+            .await
+            .unwrap()
+            .into_inner()
+            .name,
+        "Ada"
+    );
+    let mut forged = credential(&ada, proto::Empty {});
+    forged
+        .metadata_mut()
+        .insert("bbs-human", "Bob".parse().unwrap());
+    assert_eq!(
+        client.whoami(forged).await.unwrap_err().code(),
+        tonic::Code::Unauthenticated
+    );
+    let a = protected_register(&mut client, &ada, "Alpha").await;
+    let b = protected_register(&mut client, &bob, "Bravo").await;
+    assert_eq!(a.token.len(), 26);
+    let bind = |token: &str| proto::BindSessionRequest {
+        harness: "test".into(),
+        session_id: "shared".into(),
+        token: token.into(),
+    };
+    let lookup = || proto::SessionAgentRequest {
+        harness: "test".into(),
+        session_id: "shared".into(),
+    };
+    client
+        .bind_session(credential(&ada, bind(&a.token)))
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .session_agent(credential(&ada, lookup()))
+            .await
+            .unwrap()
+            .into_inner()
+            .token,
+        a.token
+    );
+    assert_eq!(
+        client.session_agent(lookup()).await.unwrap_err().code(),
+        tonic::Code::Unauthenticated
+    );
+    let foreign = client
+        .session_agent(credential(&bob, lookup()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(foreign.agent.is_none() && foreign.token.is_empty());
+    assert!(
+        client
+            .bind_session(credential(&bob, bind(&a.token)))
+            .await
+            .is_err()
+    );
+    assert!(
+        client
+            .bind_session(credential(&bob, bind(&b.token)))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        client
+            .whoami(as_agent(&a.token, proto::Empty {}))
+            .await
+            .unwrap()
+            .into_inner()
+            .name,
+        "Alpha"
+    );
+    let db = rusqlite::Connection::open(server.home.join(".local/state/bbs/bbs.db")).unwrap();
+    let hash: String = db.query_row("SELECT token_hash FROM human_tokens JOIN humans ON humans.id = human_tokens.human_id WHERE humans.name = 'Ada'", [], |r| r.get(0)).unwrap();
+    assert_eq!(hash.len(), 64);
+    assert!(!hash.contains(&ada));
+    // Required mode rejects both old short tokens and agents with no owner.
+    db.execute(
+        "UPDATE agents SET token = 'abcdefg' WHERE name = 'Alpha'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        client
+            .whoami(as_agent("abcdefg", proto::Empty {}))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+    assert!(
+        client
+            .session_agent(credential(&ada, lookup()))
+            .await
+            .unwrap()
+            .into_inner()
+            .token
+            .is_empty()
+    );
+    db.execute(
+        "DELETE FROM agent_owners WHERE agent_id = (SELECT id FROM agents WHERE name = 'Bravo')",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        client
+            .whoami(as_agent(&b.token, proto::Empty {}))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+}
+
+#[tokio::test]
+async fn live_rotation_and_revocation_end_idle_streams() {
+    let server = Server::start_mode("protected-revoke", true);
+    let mut client = server.client().await;
+    let old = server.admin("add", "Ada");
+    let agent = protected_register(&mut client, &old, "Alpha").await;
+    let mut old_feed = client
+        .watch_feed(credential(&old, proto::FeedRequest { backlog: 10 }))
+        .await
+        .unwrap()
+        .into_inner();
+    old_feed.message().await.unwrap().unwrap();
+    let new = server.admin("rotate", "Ada");
+    assert_ne!(old, new);
+    assert_eq!(
+        client
+            .whoami(credential(&old, proto::Empty {}))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+    client
+        .whoami(credential(&new, proto::Empty {}))
+        .await
+        .unwrap();
+    client
+        .whoami(as_agent(&agent.token, proto::Empty {}))
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(7), old_feed.message())
+            .await
+            .unwrap()
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+    let mut mail = client
+        .wait_for_mail(as_agent(&agent.token, proto::WaitRequest { limit: None }))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut feed = client
+        .watch_feed(credential(&new, proto::FeedRequest { backlog: 10 }))
+        .await
+        .unwrap()
+        .into_inner();
+    feed.message().await.unwrap().unwrap();
+    server.admin("revoke", "Ada");
+    assert_eq!(
+        client
+            .whoami(credential(&new, proto::Empty {}))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+    assert_eq!(
+        client
+            .whoami(as_agent(&agent.token, proto::Empty {}))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+    let (mail_end, feed_end) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(7), mail.message()),
+        tokio::time::timeout(Duration::from_secs(7), feed.message())
+    );
+    assert_eq!(
+        mail_end.unwrap().unwrap_err().code(),
+        tonic::Code::Unauthenticated
+    );
+    assert_eq!(
+        feed_end.unwrap().unwrap_err().code(),
+        tonic::Code::Unauthenticated
+    );
+    let restored = server.admin("rotate", "Ada");
+    client
+        .whoami(credential(&restored, proto::Empty {}))
+        .await
+        .unwrap();
+    client
+        .whoami(as_agent(&agent.token, proto::Empty {}))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn authentication_failure_budget_preserves_valid_callers_and_health() {
+    let server = Server::start_mode("auth-rate", true);
+    let mut client = server.client().await;
+    for _ in 0..20 {
+        assert_eq!(
+            client
+                .whoami(credential("incorrect", proto::Empty {}))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+    }
+    assert_eq!(
+        client
+            .whoami(credential("incorrect", proto::Empty {}))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::ResourceExhausted
+    );
+    let valid = server.admin("add", "Ada");
+    client
+        .whoami(credential(&valid, proto::Empty {}))
+        .await
+        .unwrap();
+    client.server_info(proto::Empty {}).await.unwrap();
+    let mut health = HealthClient::new(
+        Channel::from_shared(format!("http://{}", server.addr))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        health
+            .check(HealthCheckRequest {
+                service: "bbs.v1.Bbs".into()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .status(),
+        ServingStatus::Serving
+    );
+}
+
+#[tokio::test]
+async fn enrollment_validates_before_saving_and_binds_credentials_to_server() {
+    use std::io::Write;
+    let server = Server::start_mode("auth-enrollment", true);
+    let other = Server::start_mode("auth-other", true);
+    let token = server.admin("add", "Ada");
+    let home = tempfile::tempdir().unwrap();
+    let enroll = |token: &str, extra: &[&str]| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_bbs"))
+            .args(["init", "--server", &server.addr, "--human-token-stdin"])
+            .args(extra)
+            .env("HOME", home.path())
+            .env("USER", "unrelated")
+            .env_remove("BBS_SERVER")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(child.stdin.take().unwrap(), "{token}").unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let failed = enroll("invalid-secret", &[]);
+    assert!(!failed.status.success());
+    assert!(!String::from_utf8_lossy(&failed.stderr).contains("invalid-secret"));
+    let path = home.path().join(".config/bbs/config.toml");
+    assert!(!path.exists());
+    let ok = enroll(&token, &[]);
+    assert!(
+        ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("human = \"Ada\""));
+    assert!(saved.contains(&token));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    assert!(!enroll(&token, &["--human", "Bob"]).status.success());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+    // Even when the alternate server recognizes the same credential, it must
+    // not receive a token cached for the first server.
+    let db = rusqlite::Connection::open(server.home.join(".local/state/bbs/bbs.db")).unwrap();
+    let hash: String = db
+        .query_row("SELECT token_hash FROM human_tokens", [], |r| r.get(0))
+        .unwrap();
+    other.admin("add", "Ada");
+    let other_db = rusqlite::Connection::open(other.home.join(".local/state/bbs/bbs.db")).unwrap();
+    other_db
+        .execute("UPDATE human_tokens SET token_hash = ?1", [hash])
+        .unwrap();
+    let overridden = Command::new(env!("CARGO_BIN_EXE_bbs"))
+        .arg("whoami")
+        .env("HOME", home.path())
+        .env("BBS_SERVER", &other.addr)
+        .output()
+        .unwrap();
+    assert!(!overridden.status.success());
+    assert!(String::from_utf8_lossy(&overridden.stderr).contains("human token required"));
 }

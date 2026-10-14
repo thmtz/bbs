@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::io::Read as _;
+use std::io::{IsTerminal, Read as _};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -33,6 +33,10 @@ pub async fn run(cli: Cli) -> Result<()> {
             state_dir: Some(dir),
             ..
         }
+        | Command::Admin {
+            state_dir: Some(dir),
+            ..
+        }
         | Command::Backup {
             state_dir: Some(dir),
             ..
@@ -40,13 +44,34 @@ pub async fn run(cli: Cli) -> Result<()> {
         _ => state_dir()?,
     };
     match &cli.command {
-        Command::Init { server, human } => {
-            return init(&dir, server, human, cli.as_human.as_deref()).await;
+        Command::Init {
+            server,
+            human,
+            human_token_stdin,
+        } => {
+            return init(
+                &dir,
+                server,
+                human,
+                *human_token_stdin,
+                cli.as_human.as_deref(),
+            )
+            .await;
         }
         Command::Hook { harness } => return crate::hook::run(*harness, &dir).await,
-        Command::Serve { listen, state_dir } => {
-            return crate::serve::run(*listen, state_dir.as_deref().unwrap_or(&dir)).await;
+        Command::Serve {
+            listen,
+            state_dir,
+            require_human_token,
+        } => {
+            return crate::serve::run(
+                *listen,
+                state_dir.as_deref().unwrap_or(&dir),
+                *require_human_token,
+            )
+            .await;
         }
+        Command::Admin { command, .. } => return crate::admin::run(&dir, command),
         Command::Backup { destination, .. } => {
             crate::backup::run(&dir, destination)?;
             println!("Backup saved to {}", destination.display());
@@ -58,6 +83,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     let caller = Caller {
         token: cli.token.clone(),
         human: config.human(cli.as_human.as_deref()),
+        ..Default::default()
     };
     let mut backend = Backend::open(&config, &dir, caller).await?;
     match cli.command {
@@ -80,6 +106,7 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
         Command::Init { .. }
         | Command::Hook { .. }
         | Command::Serve { .. }
+        | Command::Admin { .. }
         | Command::Backup { .. }
         | Command::View => {
             unreachable!()
@@ -174,41 +201,77 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
     })
 }
 
-/// Merge `--server`/`--human` into the config file, then reserve the human
-/// name on the server, or in a newly created local database.
+/// Validate remote enrollment before saving credentials or changing config.
 async fn init(
     dir: &Path,
     server: &Option<String>,
     human: &Option<String>,
+    human_token_stdin: bool,
     as_human: Option<&str>,
 ) -> Result<()> {
-    if server.is_some() || human.is_some() {
-        let mut file = Config::read()?;
-        file.server = server.clone().or(file.server);
-        file.human = human.clone().or(file.human);
-        file.write()?;
-    }
-    let config = Config::load()?;
-    let name = human
-        .clone()
-        .or_else(|| config.human(as_human))
-        .context("$USER is not set; pass --human <name>")?;
-    let (mut backend, done) = match &config.server {
-        Some(addr) => (
-            Backend::Remote(Remote::connect(addr, Caller::default()).await?),
-            format!("BBS configured for server {addr}"),
-        ),
-        None => {
-            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-            (
-                Backend::Local(Local::open(dir, Caller::default())?),
-                format!("BBS initialized at {}", dir.display()),
-            )
+    let mut config = Config::load()?;
+    if let Some(server) = server {
+        if config.server.as_ref() != Some(server) {
+            config.human_token = None;
         }
-    };
-    let req = proto::EnsureHumanRequest { name: name.clone() };
-    backend.ensure_human(req).await?;
-    println!("{done}\nHuman: {name}");
+        config.server = Some(server.clone());
+    }
+    if let Some(addr) = config.server.clone() {
+        let mut backend = Backend::Remote(Remote::connect(&addr, Caller::default()).await?);
+        let info = backend.server_info().await?;
+        if human_token_stdin {
+            let mut token = String::new();
+            std::io::stdin().take(4097).read_to_string(&mut token)?;
+            anyhow::ensure!(token.len() <= 4096, "human token input is too long");
+            config.human_token = Some(token.trim().to_string());
+        }
+        if info.require_human_token && config.human_token.is_none() {
+            anyhow::ensure!(
+                std::io::stdin().is_terminal(),
+                "human token required; pass --human-token-stdin or run in a terminal"
+            );
+            config.human_token = Some(
+                rpassword::prompt_password("Human token: ")?
+                    .trim()
+                    .to_string(),
+            );
+        }
+        let name = if let Some(token) = &config.human_token {
+            backend.set_caller(Caller {
+                human_token: Some(token.clone()),
+                human: human.clone().or_else(|| as_human.map(str::to_string)),
+                ..Default::default()
+            });
+            backend.whoami().await?.name
+        } else {
+            let name = human
+                .clone()
+                .or_else(|| config.human(as_human))
+                .context("$USER is not set; pass --human <name>")?;
+            backend
+                .ensure_human(proto::EnsureHumanRequest { name: name.clone() })
+                .await?;
+            name
+        };
+        config.human = Some(name.clone());
+        config.write()?;
+        println!("BBS configured for server {addr}\nHuman: {name}");
+    } else {
+        let name = human
+            .clone()
+            .or_else(|| config.human(as_human))
+            .context("$USER is not set; pass --human <name>")?;
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let mut backend = Backend::Local(Local::open(dir, Caller::default())?);
+        backend
+            .ensure_human(proto::EnsureHumanRequest { name: name.clone() })
+            .await?;
+        if human.is_some() {
+            config.human = Some(name.clone());
+            config.write()?;
+        }
+        println!("BBS initialized at {}\nHuman: {name}", dir.display());
+    }
     Ok(())
 }
 

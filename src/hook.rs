@@ -63,6 +63,7 @@ async fn handle_event(
     backend.set_caller(Caller {
         token: Some(bound.token.clone()),
         human: None,
+        ..Default::default()
     });
 
     let additional_context = |text: String| json!({ "hookSpecificOutput": { "hookEventName": name, "additionalContext": text } });

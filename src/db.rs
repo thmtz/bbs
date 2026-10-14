@@ -13,6 +13,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0002_sessions.sql"),
     include_str!("../migrations/0003_agents_active_index.sql"),
     include_str!("../migrations/0004_agent_owners.sql"),
+    include_str!("../migrations/0005_human_tokens.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,6 +268,47 @@ pub fn agent_is_live(conn: &Connection, id: i64) -> Result<bool> {
         |r| r.get(0),
     )?;
     Ok(n > 0)
+}
+
+pub fn human_by_token_hash(conn: &Connection, hash: &str) -> Result<Option<Principal>> {
+    Ok(conn.query_row(
+        "SELECT h.id, h.name FROM humans h JOIN human_tokens t ON t.human_id = h.id WHERE t.token_hash = ?1",
+        [hash], |r| Ok(Principal { kind: Kind::Human, id: r.get(0)?, name: r.get(1)? })
+    ).optional()?)
+}
+
+pub fn set_human_token(conn: &Connection, human_id: i64, hash: &str) -> Result<()> {
+    conn.execute("INSERT INTO human_tokens (human_id, token_hash) VALUES (?1, ?2) ON CONFLICT(human_id) DO UPDATE SET token_hash = excluded.token_hash", params![human_id, hash])?;
+    Ok(())
+}
+
+pub fn revoke_human_token(conn: &Connection, human_id: i64) -> Result<()> {
+    conn.execute("DELETE FROM human_tokens WHERE human_id = ?1", [human_id])?;
+    Ok(())
+}
+
+pub fn agent_owner_id(conn: &Connection, agent_id: i64) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT human_id FROM agent_owners WHERE agent_id = ?1",
+            [agent_id],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+pub fn agent_owner_enabled(conn: &Connection, agent_id: i64) -> Result<bool> {
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM agent_owners o JOIN human_tokens t ON t.human_id = o.human_id WHERE o.agent_id = ?1)", [agent_id], |r| r.get(0))?)
+}
+
+pub fn session_binding(conn: &Connection, harness: &str, session_id: &str) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT agent_id FROM sessions WHERE harness = ?1 AND session_id = ?2",
+            params![harness, session_id],
+            |r| r.get(0),
+        )
+        .optional()?)
 }
 
 pub fn retired_agent_exists(conn: &Connection, name: &str) -> Result<bool> {

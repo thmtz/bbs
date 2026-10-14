@@ -1,6 +1,7 @@
 //! Client configuration in `~/.config/bbs/config.toml`. A missing file means
 //! local mode with no configured human.
 
+use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -8,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::home_dir;
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// `host:port` of a `bbs serve` process. Unset means local mode.
@@ -17,6 +18,9 @@ pub struct Config {
     /// This machine's human name, used when `--as` is not given.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub human: Option<String>,
+    /// Credential for `server`; never reused with a different server override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub human_token: Option<String>,
 }
 
 fn path() -> Result<PathBuf> {
@@ -32,13 +36,17 @@ impl Config {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
             Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
         };
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+        // TOML diagnostics can quote input lines containing credentials.
+        toml::from_str(&text).map_err(|_| anyhow::anyhow!("invalid config in {}", path.display()))
     }
 
     /// The effective config: the file, with `BBS_SERVER` overriding `server`.
     pub fn load() -> Result<Config> {
         let mut config = Config::read()?;
         if let Some(server) = std::env::var("BBS_SERVER").ok().filter(|s| !s.is_empty()) {
+            if config.server.as_ref() != Some(&server) {
+                config.human_token = None;
+            }
             config.server = Some(server);
         }
         Ok(config)
@@ -48,8 +56,17 @@ impl Config {
         let path = path()?;
         let dir = path.parent().expect("config path has a parent");
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        std::fs::write(&path, toml::to_string(self)?)
-            .with_context(|| format!("writing {}", path.display()))
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let mut file = tempfile::NamedTempFile::new_in(dir)?;
+        file.write_all(toml::to_string(self)?.as_bytes())?;
+        file.as_file().sync_all()?;
+        file.persist(&path)
+            .with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
     }
 
     /// The human name: `--as`, then the config, then `$USER`.
