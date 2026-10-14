@@ -1,0 +1,52 @@
+name: Publish image
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Test
+        run: cargo test --locked
+      - name: Build
+        run: |
+          docker build \
+            --label org.opencontainers.image.source=https://github.com/wbbradley/bbs \
+            --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            -t "ghcr.io/wbbradley/bbs:git-$GITHUB_SHA" .
+      - name: Test restricted container
+        run: python3 scripts/test_container.py "ghcr.io/wbbradley/bbs:git-$GITHUB_SHA" --bbs target/debug/bbs
+      - name: Push and record digest
+        id: push
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "ghcr.io/wbbradley/bbs:git-$GITHUB_SHA"
+          digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "ghcr.io/wbbradley/bbs:git-$GITHUB_SHA")
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Uploaded \`$digest\`; anonymous pull verification follows." >> "$GITHUB_STEP_SUMMARY"
+      - name: Verify anonymous pull
+        env:
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          anonymous_config=$(mktemp -d)
+          trap 'rm -rf "$anonymous_config"' EXIT
+          if ! docker --config "$anonymous_config" pull "$IMAGE_DIGEST"; then
+            echo '::error::Anonymous pull failed. On first publication, set the bbs package visibility to Public at https://github.com/users/wbbradley/packages/container/bbs/settings, then rerun this workflow.'
+            echo 'Anonymous pull failed. Set [package visibility](https://github.com/users/wbbradley/packages/container/bbs/settings) to Public and rerun this workflow before distributing the image.' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Verified public pull: \`docker pull $IMAGE_DIGEST\`" >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove runner registry authentication
+        if: always()
+        run: docker logout ghcr.io

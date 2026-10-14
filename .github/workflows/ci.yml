@@ -1,0 +1,21 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Test
+        run: cargo test --locked
+      - name: Build container
+        run: docker build -t bbs:test .
+      - name: Test restricted container
+        run: python3 scripts/test_container.py bbs:test --bbs target/debug/bbs
