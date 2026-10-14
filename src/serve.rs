@@ -27,6 +27,8 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// A waiting agent is alive; keep it clear of stale-agent retirement.
 const WAIT_TOUCH_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Leave time for process teardown within a ten-second container grace period.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(8);
 
 pub async fn run(listen: SocketAddr, dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -36,25 +38,63 @@ pub async fn run(listen: SocketAddr, dir: &Path) -> Result<()> {
 }
 
 async fn serve(conn: Connection, listen: SocketAddr, dir: &Path) -> Result<()> {
+    let signal = shutdown_signal()?;
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("binding {listen}"))?;
     let addr = listener.local_addr()?;
-    // Tests read this line to learn the port when listening on port 0.
-    println!("bbs serve listening on {addr}");
-    tracing::info!(%addr, state_dir = %dir.display(), "serving");
     let state = Arc::new(State {
         conn: Mutex::new(conn),
         notify: watch::Sender::new(0),
         waiters: Mutex::new(HashSet::new()),
+        shutdown: watch::Sender::new(false),
     });
-    tonic::transport::Server::builder()
+    let (health, health_service) = tonic_health::server::health_reporter();
+    health.set_serving::<BbsServer<Server>>().await;
+    let server = tonic::transport::Server::builder()
         .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
         .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
-        .add_service(BbsServer::new(Server(state)))
-        .serve_with_incoming(TcpListenerStream::new(listener))
-        .await?;
+        .add_service(health_service)
+        .add_service(BbsServer::new(Server(state.clone())))
+        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), state.stopping());
+    tokio::pin!(server);
+    // Tests read this line to learn the port when listening on port 0.
+    println!("bbs serve listening on {addr}");
+    tracing::info!(%addr, state_dir = %dir.display(), "serving");
+    tokio::select! {
+        result = &mut server => result?,
+        result = signal => {
+            result?;
+            health.set_not_serving::<BbsServer<Server>>().await;
+            health.set_service_status("", tonic_health::ServingStatus::NotServing).await;
+            state.shutdown.send_replace(true);
+            match tokio::time::timeout(SHUTDOWN_GRACE, &mut server).await {
+                Ok(result) => result?,
+                // Health watchers and clients that stop consuming streams can
+                // otherwise keep the HTTP/2 connection alive indefinitely.
+                Err(_) => tracing::warn!("shutdown grace expired; closing remaining connections"),
+            }
+        }
+    }
     Ok(())
+}
+
+fn shutdown_signal() -> Result<impl std::future::Future<Output = Result<()>>> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut terminate = signal(SignalKind::terminate())?;
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        Ok(async move {
+            tokio::select! {
+                _ = terminate.recv() => {},
+                _ = interrupt.recv() => {},
+            }
+            Ok(())
+        })
+    }
+    #[cfg(not(unix))]
+    Ok(async { tokio::signal::ctrl_c().await.map_err(Into::into) })
 }
 
 struct State {
@@ -63,9 +103,18 @@ struct State {
     notify: watch::Sender<u64>,
     /// Inboxes with a `WaitForMail` stream open, as (kind, id).
     waiters: Mutex<HashSet<(i32, i64)>>,
+    shutdown: watch::Sender<bool>,
 }
 
 impl State {
+    async fn stopping(&self) {
+        let _ = self
+            .shutdown
+            .subscribe()
+            .wait_for(|stopping| *stopping)
+            .await;
+    }
+
     /// Run `f` on the connection off the async runtime.
     async fn call<T, F>(self: &Arc<Self>, f: F) -> Result<T, Status>
     where
@@ -73,16 +122,18 @@ impl State {
         F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
     {
         let state = self.clone();
-        let out = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let mut conn = state.conn.lock().unwrap_or_else(PoisonError::into_inner);
-            f(&mut conn)
+            if *state.shutdown.borrow() {
+                return Err(Status::unavailable("server is shutting down"));
+            }
+            f(&mut conn).map_err(|err| Status::failed_precondition(format!("{err:#}")))
         })
         .await
         .map_err(|err| {
             tracing::error!("service call failed: {err}");
             Status::internal("internal error")
-        })?;
-        out.map_err(|err| Status::failed_precondition(format!("{err:#}")))
+        })?
     }
 
     /// Log a failed RPC with the caller's name. Tokens are credentials, so an
@@ -403,9 +454,16 @@ impl Bbs for Server {
         tokio::spawn(async move {
             let _slot = slot;
             let caller = Arc::new(caller);
-            if let Err(status) = state.wait(caller.clone(), me, limit, &tx).await {
-                state.warn_failed("wait_for_mail", &caller, &status).await;
-                let _ = tx.send(Err(status)).await;
+            tokio::select! {
+                _ = state.stopping() => {
+                    let _ = tx.send(Err(Status::unavailable("server is shutting down"))).await;
+                },
+                _ = async {
+                    if let Err(status) = state.wait(caller.clone(), me, limit, &tx).await {
+                        state.warn_failed("wait_for_mail", &caller, &status).await;
+                        let _ = tx.send(Err(status)).await;
+                    }
+                } => {},
             }
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
@@ -440,22 +498,30 @@ impl Bbs for Server {
         };
         let (tx, rx) = mpsc::channel(4);
         tokio::spawn(async move {
-            let mut snapshot = Ok(first);
-            loop {
-                if let Err(status) = &snapshot {
-                    state.warn_failed("watch_feed", &caller, status).await;
+            let send_snapshots = async {
+                let mut snapshot = Ok(first);
+                loop {
+                    if let Err(status) = &snapshot {
+                        state.warn_failed("watch_feed", &caller, status).await;
+                    }
+                    let failed = snapshot.is_err();
+                    if tx.send(snapshot).await.is_err() || failed {
+                        return;
+                    }
+                    tokio::select! {
+                        _ = changes.changed() => {}
+                        _ = tx.closed() => return,
+                    }
+                    changes.borrow_and_update();
+                    let c = caller.clone();
+                    snapshot = state.call(move |conn| service::feed(conn, &c, req)).await;
                 }
-                let failed = snapshot.is_err();
-                if tx.send(snapshot).await.is_err() || failed {
-                    return;
-                }
-                tokio::select! {
-                    _ = changes.changed() => {}
-                    _ = tx.closed() => return,
-                }
-                changes.borrow_and_update();
-                let c = caller.clone();
-                snapshot = state.call(move |conn| service::feed(conn, &c, req)).await;
+            };
+            tokio::select! {
+                _ = state.stopping() => {
+                    let _ = tx.send(Err(Status::unavailable("server is shutting down"))).await;
+                },
+                _ = send_snapshots => {},
             }
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
@@ -479,5 +545,51 @@ impl Bbs for Server {
             service::session_agent(c, r)
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shutdown_finishes_active_writes_and_rejects_new_calls() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE writes (value TEXT)")
+            .unwrap();
+        let state = Arc::new(State {
+            conn: Mutex::new(conn),
+            notify: watch::Sender::new(0),
+            waiters: Mutex::new(HashSet::new()),
+            shutdown: watch::Sender::new(false),
+        });
+        let (started, active) = tokio::sync::oneshot::channel();
+        let (finish, release) = std::sync::mpsc::channel();
+        let writer = state.clone();
+        let write = tokio::spawn(async move {
+            writer
+                .call(move |conn| {
+                    let tx = conn.transaction()?;
+                    tx.execute("INSERT INTO writes VALUES ('committed')", [])?;
+                    let _ = started.send(());
+                    release.recv_timeout(Duration::from_secs(5))?;
+                    tx.commit()?;
+                    Ok(())
+                })
+                .await
+        });
+        active.await.unwrap();
+        state.shutdown.send_replace(true);
+        finish.send(()).unwrap();
+        write.await.unwrap().unwrap();
+        let rejected = state.call(|_| Ok(())).await.unwrap_err();
+        assert_eq!(rejected.code(), tonic::Code::Unavailable);
+        let value: String = state
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT value FROM writes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(value, "committed");
     }
 }
