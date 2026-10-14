@@ -7,6 +7,9 @@ use std::time::Duration;
 
 use tonic::Request;
 use tonic::transport::Channel;
+use tonic_health::pb::{
+    HealthCheckRequest, health_check_response::ServingStatus, health_client::HealthClient,
+};
 
 mod proto {
     tonic::include_proto!("bbs.v1");
@@ -274,4 +277,129 @@ async fn watch_feed_snapshots_on_change_for_humans_only() {
     assert_eq!(next.messages.len(), 1);
     assert_eq!(next.messages[0].to_name.as_deref(), Some(a.name.as_str()));
     assert_eq!(next.messages[0].read_at, None);
+}
+
+#[tokio::test]
+async fn health_reports_initialized_services_without_a_human() {
+    let server = Server::start("health");
+    let mut health = HealthClient::new(
+        Channel::from_shared(format!("http://{}", server.addr))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap(),
+    );
+    for service in ["", "bbs.v1.Bbs"] {
+        let result = health
+            .check(HealthCheckRequest {
+                service: service.into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(result.status(), ServingStatus::Serving);
+    }
+    let error = health
+        .check(HealthCheckRequest {
+            service: "missing".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::NotFound);
+}
+
+#[cfg(unix)]
+fn signal(server: &Server, name: &str) {
+    assert!(
+        Command::new("kill")
+            .args([name, &server.child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+#[cfg(unix)]
+async fn expect_clean_exit(server: &mut Server, timeout: Duration) {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if let Some(status) = server.child.try_wait().unwrap() {
+                assert!(status.success(), "server exited with {status}");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("server finished shutdown within its grace period");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn termination_closes_mail_and_feed_streams() {
+    for name in ["-TERM", "-INT"] {
+        let mut server = Server::start(name);
+        let mut client = server.client().await;
+        client
+            .ensure_human(proto::EnsureHumanRequest {
+                name: "will".into(),
+            })
+            .await
+            .unwrap();
+        let agent = register(&mut client).await;
+        let mut mail = client
+            .wait_for_mail(as_agent(&agent.token, proto::WaitRequest { limit: None }))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut feed = client
+            .watch_feed(as_human("will", proto::FeedRequest { backlog: 10 }))
+            .await
+            .unwrap()
+            .into_inner();
+        feed.message().await.unwrap().unwrap();
+        signal(&server, name);
+        expect_clean_exit(&mut server, Duration::from_secs(3)).await;
+        assert!(mail.message().await.unwrap().is_none());
+        assert!(feed.message().await.unwrap().is_none());
+        let db = rusqlite::Connection::open(server.home.join(".local/state/bbs/bbs.db")).unwrap();
+        let integrity: String = db
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn health_watchers_cannot_prevent_shutdown() {
+    let mut server = Server::start("health-watch-shutdown");
+    let mut health = HealthClient::new(
+        Channel::from_shared(format!("http://{}", server.addr))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap(),
+    );
+    let mut watch = health
+        .watch(HealthCheckRequest {
+            service: "bbs.v1.Bbs".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        watch.message().await.unwrap().unwrap().status(),
+        ServingStatus::Serving
+    );
+    signal(&server, "-TERM");
+    let last = tokio::time::timeout(Duration::from_secs(2), watch.message())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(last.status(), ServingStatus::NotServing);
+    // Keep the health stream alive: the server must enforce its drain deadline.
+    expect_clean_exit(&mut server, Duration::from_secs(10)).await;
+    drop(watch);
 }
