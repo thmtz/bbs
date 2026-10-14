@@ -1,5 +1,6 @@
 mod app;
 mod backend;
+mod backup;
 mod cli;
 mod config;
 mod db;
