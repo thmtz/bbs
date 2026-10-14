@@ -12,6 +12,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_sessions.sql"),
     include_str!("../migrations/0003_agents_active_index.sql"),
+    include_str!("../migrations/0004_agent_owners.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +46,7 @@ pub struct AgentRow {
     pub hostname: String,
     pub active_at: String,
     pub retired_at: Option<String>,
+    pub owner: Option<String>,
 }
 
 #[derive(Debug)]
@@ -59,6 +61,8 @@ pub struct MessageView {
     pub created_at: String,
     pub from_kind: Kind,
     pub from_name: String,
+    pub from_owner: Option<String>,
+    pub reader_owner: Option<String>,
     pub to_group: Option<String>,
     /// Feed only: recipient of a direct message.
     pub to_name: Option<String>,
@@ -206,13 +210,25 @@ pub fn agent_by_token(conn: &Connection, token: &str) -> Result<Option<Principal
 }
 
 pub fn live_agent_by_name(conn: &Connection, name: &str) -> Result<Option<Principal>> {
+    let (name, owner) = agent_address(name);
     Ok(conn
         .query_row(
-            "SELECT id, name FROM agents WHERE lower(name) = lower(?1) AND retired_at IS NULL",
-            params![name],
+            "SELECT a.id, a.name FROM agents a
+             LEFT JOIN agent_owners o ON o.agent_id = a.id
+             LEFT JOIN humans h ON h.id = o.human_id
+             WHERE lower(a.name) = lower(?1) AND a.retired_at IS NULL
+               AND (?2 IS NULL OR lower(h.name) = lower(?2))",
+            params![name, owner],
             agent_principal,
         )
         .optional()?)
+}
+
+fn agent_address(name: &str) -> (&str, Option<&str>) {
+    match name.split_once('@') {
+        Some((name, owner)) => (name, Some(owner)),
+        None => (name, None),
+    }
 }
 
 pub fn agent_is_live(conn: &Connection, id: i64) -> Result<bool> {
@@ -225,9 +241,14 @@ pub fn agent_is_live(conn: &Connection, id: i64) -> Result<bool> {
 }
 
 pub fn retired_agent_exists(conn: &Connection, name: &str) -> Result<bool> {
+    let (name, owner) = agent_address(name);
     let n: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM agents WHERE lower(name) = lower(?1) AND retired_at IS NOT NULL",
-        params![name],
+        "SELECT COUNT(*) FROM agents a
+         LEFT JOIN agent_owners o ON o.agent_id = a.id
+         LEFT JOIN humans h ON h.id = o.human_id
+         WHERE lower(a.name) = lower(?1) AND a.retired_at IS NOT NULL
+           AND (?2 IS NULL OR lower(h.name) = lower(?2))",
+        params![name, owner],
         |r| r.get(0),
     )?;
     Ok(n > 0)
@@ -302,6 +323,7 @@ pub fn name_last_used(conn: &Connection) -> Result<HashMap<String, String>> {
 pub struct NewAgent<'a> {
     pub name: &'a str,
     pub token: &'a str,
+    pub owner_id: i64,
     pub status: Option<&'a str>,
     pub pwd: &'a str,
     pub hostname: &'a str,
@@ -317,7 +339,12 @@ pub fn insert_agent(conn: &Connection, a: &NewAgent) -> Result<i64> {
             a.name, a.token, a.status, status_at, a.pwd, a.hostname, a.now
         ],
     )?;
-    Ok(conn.last_insert_rowid())
+    let id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO agent_owners (agent_id, human_id) VALUES (?1, ?2)",
+        params![id, a.owner_id],
+    )?;
+    Ok(id)
 }
 
 pub fn set_status(conn: &Connection, id: i64, status: &str, now: &str) -> Result<()> {
@@ -330,9 +357,12 @@ pub fn set_status(conn: &Connection, id: i64, status: &str, now: &str) -> Result
 
 pub fn list_agents(conn: &Connection, include_retired: bool) -> Result<Vec<AgentRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, status, pwd, hostname, active_at, retired_at FROM agents
-         WHERE retired_at IS NULL OR ?1
-         ORDER BY retired_at IS NOT NULL, lower(name), id",
+        "SELECT a.id, a.name, a.status, a.pwd, a.hostname, a.active_at, a.retired_at, h.name
+         FROM agents a
+         LEFT JOIN agent_owners o ON o.agent_id = a.id
+         LEFT JOIN humans h ON h.id = o.human_id
+         WHERE a.retired_at IS NULL OR ?1
+         ORDER BY a.retired_at IS NOT NULL, lower(a.name), a.id",
     )?;
     let rows = stmt
         .query_map(params![include_retired], |r| {
@@ -344,6 +374,7 @@ pub fn list_agents(conn: &Connection, include_retired: bool) -> Result<Vec<Agent
                 hostname: r.get(4)?,
                 active_at: r.get(5)?,
                 retired_at: r.get(6)?,
+                owner: r.get(7)?,
             })
         })?
         .collect::<Result<_, _>>()?;
@@ -500,11 +531,15 @@ pub fn insert_delivery(conn: &Connection, message_id: i64, kind: Kind, id: i64) 
 const INBOX_SELECT: &str = "
     SELECT m.id, m.created_at, m.from_kind,
            CASE m.from_kind WHEN 'agent' THEN a.name ELSE h.name END,
-           g.name, m.body
+           g.name, m.body, owner.name, reader_owner.name
     FROM deliveries d
     JOIN messages m ON m.id = d.message_id
     LEFT JOIN agents a ON m.from_kind = 'agent' AND a.id = m.from_id
     LEFT JOIN humans h ON m.from_kind = 'human' AND h.id = m.from_id
+    LEFT JOIN agent_owners sender ON sender.agent_id = a.id
+    LEFT JOIN humans owner ON owner.id = sender.human_id
+    LEFT JOIN agent_owners reader ON d.recipient_kind = 'agent' AND reader.agent_id = d.recipient_id
+    LEFT JOIN humans reader_owner ON reader_owner.id = reader.human_id
     LEFT JOIN bbs_groups g ON g.id = m.to_group_id
     WHERE d.recipient_kind = ?1 AND d.recipient_id = ?2";
 
@@ -519,6 +554,8 @@ fn message_view(r: &rusqlite::Row) -> rusqlite::Result<MessageView> {
             Kind::Agent
         },
         from_name: r.get(3)?,
+        from_owner: r.get(6)?,
+        reader_owner: r.get(7)?,
         to_group: r.get(4)?,
         to_name: None,
         read_at: None,
@@ -634,10 +671,12 @@ pub fn session_agent(
 pub fn recent_messages(conn: &Connection, limit: u32) -> Result<Vec<MessageView>> {
     let mut stmt = conn.prepare(
         "SELECT m.id, m.created_at, m.from_kind, COALESCE(fa.name, fh.name), g.name,
-                COALESCE(ta.name, th.name), d.archived_at, m.body
+                COALESCE(ta.name, th.name), d.archived_at, m.body, owner.name
          FROM messages m
          LEFT JOIN agents fa ON m.from_kind = 'agent' AND fa.id = m.from_id
          LEFT JOIN humans fh ON m.from_kind = 'human' AND fh.id = m.from_id
+         LEFT JOIN agent_owners sender ON sender.agent_id = fa.id
+         LEFT JOIN humans owner ON owner.id = sender.human_id
          LEFT JOIN bbs_groups g ON g.id = m.to_group_id
          LEFT JOIN deliveries d ON m.to_group_id IS NULL AND d.message_id = m.id
          LEFT JOIN agents ta ON d.recipient_kind = 'agent' AND ta.id = d.recipient_id
@@ -657,6 +696,8 @@ pub fn recent_messages(conn: &Connection, limit: u32) -> Result<Vec<MessageView>
                     Kind::Agent
                 },
                 from_name: r.get(3)?,
+                from_owner: r.get(8)?,
+                reader_owner: None,
                 to_group: r.get(4)?,
                 to_name: r.get(5)?,
                 read_at: r.get(6)?,
@@ -690,6 +731,7 @@ mod tests {
             let a = NewAgent {
                 name,
                 token,
+                owner_id: will.id,
                 status: None,
                 pwd: "/",
                 hostname: "h",
