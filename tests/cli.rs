@@ -142,7 +142,11 @@ impl Bbs {
 
     /// Register an agent and return (name, token).
     fn register(&self) -> (String, String) {
-        let out = self.ok(&["register", "--note", "testing"]);
+        self.register_with(&["register", "--note", "testing"])
+    }
+
+    fn register_with(&self, args: &[&str]) -> (String, String) {
+        let out = self.ok(args);
         let name = out.split('"').nth(1).unwrap().to_string();
         let token = out
             .split("--token ")
@@ -204,6 +208,201 @@ fn init_is_idempotent(mode: Mode) {
     assert_eq!(humans, 1);
     assert!(bbs.ok(&["group", "list"]).contains("acme"));
     bbs.ok(&["--token", &token, "group", "join", "acme"]);
+}
+
+fn requested_names_are_validated_and_reserved(mode: Mode) {
+    let bbs = Bbs::with_mode("requested-name", mode);
+    let (name, token) = bbs.register_with(&["register", "--name", "Jeffrey"]);
+    assert_eq!(name, "Jeffrey");
+    assert_eq!(bbs.ok(&["--token", &token, "whoami"]), "Jeffrey\n");
+    assert!(
+        bbs.err(&["register", "--name", "jEfFrEy"])
+            .contains("already reserved")
+    );
+    assert!(
+        bbs.err(&["register", "--name", "WILL"])
+            .contains("already reserved")
+    );
+    assert!(
+        bbs.err(&["human", "add", "Jeffrey"])
+            .contains("in use by an agent")
+    );
+    assert!(
+        bbs.err(&["--as", "missing", "register"])
+            .contains("unknown human")
+    );
+    for invalid in [
+        "",
+        "@Jeffrey",
+        "Jeffrey@will",
+        "two words",
+        "a,b",
+        "../x",
+        "-a",
+        "é",
+        &"a".repeat(65),
+    ] {
+        assert!(
+            bbs.err(&["register", &format!("--name={invalid}")])
+                .contains("invalid agent name")
+        );
+    }
+    let count: i64 = bbs
+        .db()
+        .query_row("SELECT COUNT(*) FROM agents", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 1,
+        "failed requests must not register fallback identities"
+    );
+    bbs.ok(&["--token", &token, "bye"]);
+    let (name, replacement) = bbs.register_with(&["register", "--name", "Jeffrey"]);
+    assert_eq!(name, "Jeffrey");
+    assert_ne!(replacement, token);
+    bbs.register_with(&["register", "--name", "Agent_1.test-2"]);
+}
+
+fn concurrent_registration_reserves_one_name(mode: Mode) {
+    let bbs = Bbs::with_mode("name-race", mode);
+    let children: Vec<_> = (0..6)
+        .map(|_| bbs.spawn(&["register", "--name", "Jeffrey"]))
+        .collect();
+    let mut successes = 0;
+    for child in children {
+        let out = child.wait_with_output().unwrap();
+        if out.status.success() {
+            successes += 1;
+        } else {
+            let err = String::from_utf8(out.stderr).unwrap();
+            assert!(err.contains("already reserved"), "{err}");
+        }
+    }
+    assert_eq!(successes, 1);
+}
+
+fn registration_records_human_from_as_config_or_user(mode: Mode) {
+    let bbs = Bbs::with_mode("owner-config", mode);
+    let (_, user) = bbs.register();
+    bbs.ok(&["init", "--human", "Ada"]);
+    let (_, configured) = bbs.register();
+    let (_, explicit) = bbs.register_with(&["--as", "WILL", "register"]);
+    let db = bbs.db();
+    for (token, expected) in [(&user, "will"), (&configured, "Ada"), (&explicit, "will")] {
+        let owner: String = db
+            .query_row(
+                "SELECT h.name FROM agents a JOIN agent_owners o ON o.agent_id = a.id
+             JOIN humans h ON h.id = o.human_id WHERE a.token = ?1",
+                [token],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner, expected);
+    }
+    assert!(
+        db.execute(
+            "INSERT INTO agent_owners (agent_id, human_id)
+         SELECT a.id, h.id FROM agents a, humans h WHERE a.token = ?1 AND h.name = 'Ada'",
+            [&user],
+        )
+        .is_err(),
+        "an agent may have only one owner"
+    );
+}
+
+fn cross_owner_messages_are_qualified_for_each_reader(mode: Mode) {
+    let bbs = Bbs::with_mode("cross-owner", mode);
+    bbs.ok(&["human", "add", "Ada"]);
+    bbs.ok(&["group", "register", "acme"]);
+    let (sender, ts) = bbs.register_with(&["register", "--name", "Jeffrey"]);
+    let (same, same_token) = bbs.register();
+    let (other, other_token) = bbs.register_with(&["--as", "ada", "register"]);
+    for token in [&ts, &same_token, &other_token] {
+        bbs.ok(&["--token", token, "group", "join", "acme"]);
+    }
+    for token in [&ts, &same_token, &other_token] {
+        bbs.ok(&["--token", token, "read"]);
+    }
+    bbs.ok(&["--token", &ts, "send", "--to", "@acme", "broadcast"]);
+    let same_mail = bbs.ok(&["--token", &same_token, "read"]);
+    let other_mail = bbs.ok(&["--token", &other_token, "read"]);
+    assert!(same_mail.contains("from Jeffrey to @acme:"), "{same_mail}");
+    assert!(
+        other_mail.contains("from Jeffrey@will to @acme:"),
+        "{other_mail}"
+    );
+    assert!(bbs.ok(&["read"]).contains("from Jeffrey to @acme:"));
+
+    bbs.ok(&["--token", &ts, "send", "--to", &other, "direct"]);
+    let direct = bbs.ok(&["--token", &other_token, "read", "--wait"]);
+    assert!(
+        direct.contains(&format!("from Jeffrey@will to {other}:\ndirect")),
+        "{direct}"
+    );
+    bbs.ok(&[
+        "--token",
+        &other_token,
+        "send",
+        "--to",
+        "jeffrey@WILL",
+        "reply",
+    ]);
+    let reply = bbs.ok(&["--token", &ts, "read"]);
+    assert!(
+        reply.contains(&format!("from {other}@Ada to Jeffrey:")),
+        "{reply}"
+    );
+    assert!(
+        bbs.err(&[
+            "--token",
+            &other_token,
+            "send",
+            "--to",
+            "Jeffrey@Ada",
+            "wrong owner"
+        ])
+        .contains("no such")
+    );
+    bbs.ok(&["--token", &ts, "send", "--to", &same, "same owner"]);
+    assert!(
+        bbs.ok(&["--token", &same_token, "read"])
+            .contains("from Jeffrey to ")
+    );
+
+    bbs.ok(&["--token", &ts, "bye"]);
+    assert!(
+        bbs.err(&[
+            "--token",
+            &other_token,
+            "send",
+            "--to",
+            "Jeffrey@will",
+            "retired"
+        ])
+        .contains("offline")
+    );
+    let (_, replacement) = bbs.register_with(&["--as", "Ada", "register", "--name", &sender]);
+    bbs.ok(&["--token", &replacement, "group", "join", "acme"]);
+    bbs.ok(&["--token", &replacement, "send", "--to", &other, "new owner"]);
+    assert!(
+        bbs.ok(&["--token", &other_token, "read"])
+            .contains(&format!("from Jeffrey to {other}:\nnew owner"))
+    );
+    let history = bbs.ok(&["--token", &other_token, "read", "--archived"]);
+    assert!(
+        history.contains(&format!("from Jeffrey@will to {other}:\ndirect")),
+        "{history}"
+    );
+    assert!(
+        bbs.err(&[
+            "--token",
+            &other_token,
+            "send",
+            "--to",
+            "Jeffrey@will",
+            "stale address"
+        ])
+        .contains("offline")
+    );
 }
 
 fn config_path(bbs: &Bbs) -> PathBuf {
@@ -743,7 +942,8 @@ fn claude_code_hooks_bind_and_deliver(mode: Mode) {
             .unwrap()
             .to_string(),
     );
-    let (b, tb) = bbs.register();
+    bbs.ok(&["human", "add", "ada"]);
+    let (b, tb) = bbs.register_with(&["--as", "ada", "register", "--name", "Jeffrey"]);
     bbs.ok(&["--token", &ta, "group", "join", "acme"]);
     bbs.ok(&["--token", &tb, "group", "join", "acme"]);
     bbs.ok(&["send", "--to", &a, "before binding"]);
@@ -790,7 +990,7 @@ fn claude_code_hooks_bind_and_deliver(mode: Mode) {
         out["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .unwrap()
-            .contains(&format!("from {b}"))
+            .contains(&format!("from {b}@ada to {a}:"))
     );
 
     // After compaction the identity is re-injected.
@@ -1009,7 +1209,7 @@ fn old_schema_is_migrated_on_open_even_concurrently() {
     let version: i64 = db
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert!(version >= 3, "schema still at v{version}");
+    assert!(version >= 4, "schema still at v{version}");
     std::fs::remove_dir_all(&home).unwrap();
 }
 
@@ -1020,6 +1220,10 @@ fn view_is_for_humans_only(mode: Mode) {
 }
 
 both_modes!(
+    requested_names_are_validated_and_reserved,
+    concurrent_registration_reserves_one_name,
+    registration_records_human_from_as_config_or_user,
+    cross_owner_messages_are_qualified_for_each_reader,
     init_is_idempotent,
     direct_messages_within_group,
     humans_message_agents_and_humans_but_agents_cannot_dm_humans,

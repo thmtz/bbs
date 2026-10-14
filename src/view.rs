@@ -110,7 +110,7 @@ fn header(row: &Message) -> Line<'static> {
             Style::new().fg(Color::DarkGray),
         ),
         Span::raw("  "),
-        name_span(&row.from_name, row.from_kind()),
+        name_span(&row.sender_display_name(), row.from_kind()),
         Span::styled(" → ", Style::new().fg(Color::DarkGray)),
     ];
     match (&row.to_group, &row.to_name) {
@@ -174,6 +174,8 @@ mod tests {
             created_at: "2026-10-09T14:02:11.000000Z".into(),
             from_kind: Kind::Agent.into(),
             from_name: "Juliana".into(),
+            from_owner: None,
+            reader_owner: None,
             to_group: group.map(Into::into),
             to_name: to.map(Into::into),
             read_at: read_at.map(Into::into),

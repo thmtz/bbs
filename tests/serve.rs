@@ -74,12 +74,29 @@ fn as_human<T>(name: &str, msg: T) -> Request<T> {
 }
 
 async fn register(client: &mut BbsClient<Channel>) -> proto::RegisterResponse {
+    register_as(client, "will", None).await
+}
+
+async fn register_as(
+    client: &mut BbsClient<Channel>,
+    human: &str,
+    name: Option<&str>,
+) -> proto::RegisterResponse {
+    client
+        .ensure_human(proto::EnsureHumanRequest { name: human.into() })
+        .await
+        .unwrap();
     let req = proto::RegisterRequest {
+        name: name.map(str::to_string),
         note: Some("testing".into()),
         pwd: "/tmp".into(),
         hostname: "test".into(),
     };
-    client.register(req).await.unwrap().into_inner()
+    client
+        .register(as_human(human, req))
+        .await
+        .unwrap()
+        .into_inner()
 }
 
 #[tokio::test]
@@ -104,8 +121,9 @@ async fn serve_round_trip_and_wait_for_mail() {
         .await
         .unwrap();
 
-    let a = register(&mut client).await;
-    let b = register(&mut client).await;
+    let a = register_as(&mut client, "will", Some("Jeffrey")).await;
+    let b = register_as(&mut client, "ada", None).await;
+    assert_eq!(a.name, "Jeffrey");
     for agent in [&a, &b] {
         let joined = client
             .group_join(as_agent(&agent.token, group.clone()))
@@ -120,6 +138,15 @@ async fn serve_round_trip_and_wait_for_mail() {
         .unwrap()
         .into_inner();
     assert_eq!(me.name, b.name);
+    let agents = client
+        .list_agents(as_agent(&b.token, proto::ListAgentsRequest { all: false }))
+        .await
+        .unwrap()
+        .into_inner()
+        .agents;
+    let sender = agents.iter().find(|agent| agent.name == a.name).unwrap();
+    assert_eq!(sender.name, "Jeffrey");
+    assert_eq!(sender.owner.as_deref(), Some("will"));
 
     // Errors carry the service's message text.
     let err = client
@@ -171,6 +198,8 @@ async fn serve_round_trip_and_wait_for_mail() {
         .expect("one message");
     assert_eq!(got.body, "wake up");
     assert_eq!(got.from_name, a.name);
+    assert_eq!(got.from_owner.as_deref(), Some("will"));
+    assert_eq!(got.reader_owner.as_deref(), Some("ada"));
     assert_eq!(got.to_name.as_deref(), Some(b.name.as_str()));
     let end = tokio::time::timeout(Duration::from_secs(5), waiter.message())
         .await

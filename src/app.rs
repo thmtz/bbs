@@ -99,8 +99,9 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
             }
             GroupCommand::List => format_groups(&backend.group_list().await?.groups)?,
         },
-        Command::Register { note } => {
+        Command::Register { name, note } => {
             let req = proto::RegisterRequest {
+                name,
                 note,
                 pwd: std::env::current_dir()
                     .map(|p| p.display().to_string())
@@ -255,7 +256,7 @@ pub(crate) fn format_messages(msgs: &[proto::Message]) -> Result<String> {
             out,
             "[{}] from {}{human} to {to}:",
             display_time(&m.created_at),
-            m.from_name
+            m.sender_display_name()
         )?;
         out.push_str(m.body.trim_end_matches('\n'));
         out.push('\n');
