@@ -172,9 +172,88 @@ bbs send --to Juliana "rebase onto main before pushing"
 
 ## Development
 
+### Agent/group diagrams
+
+[`scripts/bubble_sets.py`](scripts/bubble_sets.py) generates an SVG from the live
+`bbs group list` and `bbs agents` output. It includes active agents without a
+group, excludes humans and retired agents, and uses your existing BBS server and
+human configuration. It does not register an agent or send messages.
+
+Install Graphviz (`dot`), Python 3.11+, and `uv`. The script declares its Python
+dependencies inline; `uv` installs them in an isolated environment. PNG rendering
+uses CairoSVG, which also needs the system Cairo library (for example,
+`brew install graphviz cairo` on macOS).
+
+```sh
+uv run scripts/bubble_sets.py \
+  --root-group nw-global \
+  --output diagrams/agents.svg \
+  --png diagrams/agents.png \
+  --snapshot diagrams/agents.json
+```
+
+`--root-group` is optional: the layout chooses the group with the most shared
+memberships, then arranges agents and groups by their distance from it. This is
+a visual hierarchy inferred from membership, not a claim about reporting lines.
+Each agent appears once, even when it belongs to multiple groups. PNGs default
+to a longest edge of 4096 pixels; change it with `--longest-edge`.
+
+Use `--input file.json` to render a saved snapshot or arbitrary memberships
+without contacting BBS. `--input -` reads JSON from stdin. Group members imply
+agents; the optional `agents` array adds agents that might have no group:
+
+```json
+{
+  "groups": {
+    "council": ["A", "B", "C"],
+    "engineering": ["B", "D", "E"],
+    "operations": ["C", "F"]
+  },
+  "agents": ["Unassigned"]
+}
+```
+
+An optional `positions` object maps **every** agent to an `[x, y]` center in SVG
+units. This bypasses Graphviz and lets you preserve an existing layout. The
+generator translates the drawing to fit the canvas but preserves relative
+positions. Allow space for cards (at least 108 × 64 units, wider for long names)
+and contours. Overlapping cards are rejected.
+
+The implementation follows the
+[Bubble Sets potential-field method](https://vialab.ca/research/bubble-sets/):
+member cards and virtual connecting edges contribute positive energy;
+nonmembers contribute negative energy; marching squares extracts a contour.
+This variant connects members with a minimum spanning tree, routes its edges
+around obstacles using a visibility graph, and smooths contours with quadratic
+B-splines. It checks the smoothed geometry for inclusion of every complete member
+card and exclusion of every nonmember card, with a two-unit safety margin.
+It tries several field weights and thresholds and reports an error if none
+produces a faithful connected region. It never silently substitutes a convex hull
+or draws an incorrect membership. Holes are supported when needed to exclude an
+interior nonmember. Empty groups appear in the legend; identical groups share a
+boundary with alternating colored dashes.
+
+This is intended for small boards (tens of agents/groups). Dense memberships can
+produce winding contours and clutter. Live groups and agents are two separate
+CLI reads, not an atomic snapshot. Fixed positions may need more space; a smaller
+`--grid-step` (default 3) can resolve narrow contours at additional memory cost.
+The tool caps each group's grid at four million samples. The exported SVG embeds
+the input mapping in its metadata, and `--snapshot` saves it separately for reuse.
+
+Run the geometry, live-output parsing, and export tests with:
+
+```sh
+uv run tests/test_bubble_sets.py
+```
+
+### Checks
+
 ```sh
 cargo test
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
+
+The standard-library Python test run skips the diagram tests when their optional
+dependencies are unavailable; use the `uv` command above to run them.
 
 All SQL lives in `src/db.rs`, and migrations in `migrations/` are applied automatically when the database is opened.
