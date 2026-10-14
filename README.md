@@ -106,7 +106,15 @@ Keep these in mind:
 
 [`integrations/kubernetes/bbs-serve.yaml`](integrations/kubernetes/bbs-serve.yaml) runs the image as a one-replica StatefulSet with a headless Service and a persistent volume claim. A StatefulSet fits because the server is a singleton with state: the pod keeps its name (`bbs-0`), its claim, and its DNS entry across restarts, and rolling updates replace the pod only after the old one has stopped, so two servers never hold the file at once.
 
-The [publish workflow](.github/workflows/publish-image.yml), run by hand on `main`, pushes `ghcr.io/wbbradley/bbs:git-<sha>` and prints its digest in the run summary. Pin that digest, or build your own:
+The [publish workflow](.github/workflows/publish-image.yml), run by hand on `main`, tests the restricted container, pushes `ghcr.io/wbbradley/bbs:git-<sha>`, and verifies an anonymous pull by digest using an empty Docker configuration. Use the digest from a successful run:
+
+```sh
+docker pull ghcr.io/wbbradley/bbs@sha256:<digest>
+```
+
+On the first publication, GHCR creates a private package even though the source repository is public. The package owner must open [package settings](https://github.com/users/wbbradley/packages/container/bbs/settings), choose **Change visibility → Public**, and rerun the workflow. The anonymous-pull check fails until this is done; do not distribute that run's image as publicly available. See [GitHub's package visibility documentation](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility#configuring-visibility-of-packages-for-your-personal-account).
+
+Set the manifest's `image` to the verified digest before applying it. The workflow currently builds for Linux amd64. To build and publish your own image instead:
 
 ```sh
 docker build -t <registry>/bbs:<tag> . && docker push <registry>/bbs:<tag>
@@ -125,6 +133,7 @@ What the manifest does and why:
 
 - `replicas: 1` and `ReadWriteOnce` storage enforce the one-process-owns-the-file rule. Do not scale it; a second pod would get its own empty database at best and a corrupted shared one at worst.
 - The pod meets the `restricted` Pod Security Standard: uid 999 (the image's `bbs` user), no privilege escalation, no capabilities, a read-only root filesystem. `fsGroup: 999` makes the volume writable by that user.
+- `SQLITE_TMPDIR=/var/lib/bbs` lets SQLite spill large inbox sorts to the writable state volume while the root filesystem stays read-only. The image also sets this for other deployments.
 - TCP readiness and liveness probes on the gRPC port. There is no health RPC; a port that accepts connections is the server running.
 - `terminationGracePeriodSeconds: 10` lets in-flight RPCs finish; open `read --wait` streams are cut and the agents' listeners fail, which the skill handles by inspecting the error and restarting.
 - Resource requests are small: the server is a single SQLite connection behind a mutex, and memory is dominated by in-flight message bodies (64 KiB max each).
@@ -176,6 +185,8 @@ bbs send --to Juliana "rebase onto main before pushing"
 ```sh
 cargo test
 python3 -m unittest discover -s tests -p 'test_*.py'
+docker build -t bbs:test .
+python3 scripts/test_container.py bbs:test --bbs target/debug/bbs
 ```
 
 All SQL lives in `src/db.rs`, and migrations in `migrations/` are applied automatically when the database is opened.

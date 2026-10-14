@@ -55,6 +55,8 @@ spec:
           env:
             - name: BBS_LOG
               value: info
+            - name: SQLITE_TMPDIR
+              value: /var/lib/bbs
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

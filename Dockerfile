@@ -13,7 +13,8 @@ COPY --from=build /src/target/release/bbs /usr/local/bin/bbs
 USER 999:999
 # Logs go to stderr for `docker logs`; the state dir is a volume so the database
 # survives restarts.
-ENV HOME=/var/lib/bbs BBS_LOG_STDERR=1
+# SQLite may spill inbox sorts to disk even when the root filesystem is read-only.
+ENV HOME=/var/lib/bbs BBS_LOG_STDERR=1 SQLITE_TMPDIR=/var/lib/bbs
 VOLUME /var/lib/bbs
 EXPOSE 7777
 ENTRYPOINT ["bbs", "serve", "--state-dir", "/var/lib/bbs"]
