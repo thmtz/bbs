@@ -322,7 +322,12 @@ separately implemented and tested. [Rust rename reference](https://doc.rust-lang
 Retain at least the current and previous complete releases. Cleanup must never
 remove the worker's running executable/root or an active/retained release.
 `update rollback` selects a retained compatible root under the same installation
-lock; it never restores data or changes credentials. Initial background use is
+lock; it never restores data or changes credentials. Before changing the pointer,
+persist `notify` mode so the next scheduled check cannot reinstall the release
+the human just rejected. If that policy write fails, refuse rollback; if pointer
+replacement fails, remain in `notify` and report the failure. Resuming automatic
+installation requires explicit re-enablement with the available target shown.
+Initial background use is
 for configured remote clients; keep server installations separate and local-only
 clients on manual updates.
 
@@ -385,6 +390,7 @@ for version discovery and notifications.
 | Failed candidate identity/compatibility check | No activation; retain current installation and error record |
 | Candidate can read current schema but migrates beyond incumbent | Automatic update refused despite compatible read range |
 | Local schema too new for rollback | Refuse unsafe rollback; leave database untouched |
+| Human rolls back a release that passed automated checks | Persist notify mode before switching; no automatic reinstall until explicit re-enablement |
 | Stale linked skill or edited checkout | Notice/manual integration procedure; no checkout mutation |
 | Server/container invocation | No background client installer and no process restart |
 
