@@ -62,7 +62,7 @@ Extend the existing `ServerInfoResponse`; preserve `require_human_token = 1`.
 Move the service to package `bbs.v2` for the initial enforced contract. Retain the
 existing operation shapes and field numbers, and add a release-information
 message, protocol epoch, capabilities, and
-optional minimum/recommended client versions. Use presence-aware fields so a
+optional minimum/recommended client versions. Use presence-aware fields so
 missing or malformed information cannot be mistaken for protocol epoch zero. Do not duplicate
 this information into every protobuf response. Adding fields while preserving
 numbers follows the [protobuf evolution rules](https://protobuf.dev/programming-guides/proto3/#updating).
@@ -169,7 +169,11 @@ or that the current installation is obsolete.
 
 Keep update preferences in a separate `~/.config/bbs/updates.toml`, avoiding new
 fields in the existing strict client config. Keep cache, status, locks, and build
-logs under `~/.local/state/bbs/updates/`, keyed by canonical installation path.
+logs under `~/.local/state/bbs/updates/`, keyed by the stable installation root.
+For managed installations this is the canonical `cli` directory, not the resolved
+`current` symlink or version-specific executable path. For manual Cargo installs
+it is the confirmed Cargo root. Old and new invocations must share the same state
+and lock after activation; separate installations must remain independent.
 Use private permissions; never persist human or agent credentials in update state.
 
 Proposed commands:
