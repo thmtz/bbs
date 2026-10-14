@@ -17,8 +17,17 @@ use std::sync::Mutex;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-/// Log to ~/bbs.log. Logging is best-effort: failure to open the file never blocks the CLI.
+/// Log to ~/bbs.log, or to stderr when `BBS_LOG_STDERR=1` (containers). Logging is
+/// best-effort: failure to open the file never blocks the CLI.
 fn init_logging() {
+    let filter = EnvFilter::try_from_env("BBS_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+    let fmt = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter(filter);
+    if std::env::var_os("BBS_LOG_STDERR").is_some_and(|v| v == "1") {
+        fmt.with_writer(std::io::stderr).init();
+        return;
+    }
     let Ok(home) = app::home_dir() else { return };
     let Ok(file) = OpenOptions::new()
         .create(true)
@@ -27,12 +36,7 @@ fn init_logging() {
     else {
         return;
     };
-    let filter = EnvFilter::try_from_env("BBS_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_writer(Mutex::new(file))
-        .with_ansi(false)
-        .with_env_filter(filter)
-        .init();
+    fmt.with_writer(Mutex::new(file)).init();
 }
 
 #[tokio::main]

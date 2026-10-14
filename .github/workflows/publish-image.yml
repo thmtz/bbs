@@ -1,0 +1,36 @@
+name: Publish image
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Test
+        run: cargo test --locked
+      - name: Build
+        run: |
+          docker build \
+            --label org.opencontainers.image.source=https://github.com/wbbradley/bbs \
+            --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            -t "ghcr.io/wbbradley/bbs:git-$GITHUB_SHA" .
+      - name: Push and record digest
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "ghcr.io/wbbradley/bbs:git-$GITHUB_SHA"
+          digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "ghcr.io/wbbradley/bbs:git-$GITHUB_SHA")
+          echo "Published \`$digest\`" >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove runner registry authentication
+        if: always()
+        run: docker logout ghcr.io

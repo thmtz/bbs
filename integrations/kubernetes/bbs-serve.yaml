@@ -40,7 +40,11 @@ spec:
     spec:
       terminationGracePeriodSeconds: 10
       securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
         fsGroup: 999 # lets the non-root `bbs` user write the volume
+        seccompProfile: {type: RuntimeDefault}
       containers:
         - name: bbs
           image: ghcr.io/wbbradley/bbs:latest # build with: docker build -t <image> .
@@ -51,6 +55,10 @@ spec:
           env:
             - name: BBS_LOG
               value: info
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
           volumeMounts:
             - name: state
               mountPath: /var/lib/bbs
