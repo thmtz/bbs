@@ -1,9 +1,9 @@
 //! `bbs serve`: a gRPC server over the service layer. It owns the SQLite file;
-//! nothing else may open that file while it runs, because the waiters' notify
-//! only sees commits made through this process.
+//! message writers must use this process so waiters see their commits. Local
+//! credential administration is observed separately on calls and stream checks.
 
-use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
@@ -30,14 +30,19 @@ const WAIT_TOUCH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// Leave time for process teardown within a ten-second container grace period.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(8);
 
-pub async fn run(listen: SocketAddr, dir: &Path) -> Result<()> {
+pub async fn run(listen: SocketAddr, dir: &Path, require_human_token: bool) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let mut conn = db::open(&dir.join("bbs.db"))?;
     db::migrate(&mut conn)?;
-    serve(conn, listen, dir).await
+    serve(conn, listen, dir, require_human_token).await
 }
 
-async fn serve(conn: Connection, listen: SocketAddr, dir: &Path) -> Result<()> {
+async fn serve(
+    conn: Connection,
+    listen: SocketAddr,
+    dir: &Path,
+    require_human_token: bool,
+) -> Result<()> {
     let signal = shutdown_signal()?;
     let listener = tokio::net::TcpListener::bind(listen)
         .await
@@ -48,6 +53,8 @@ async fn serve(conn: Connection, listen: SocketAddr, dir: &Path) -> Result<()> {
         notify: watch::Sender::new(0),
         waiters: Mutex::new(HashSet::new()),
         shutdown: watch::Sender::new(false),
+        require_human_token,
+        auth_failures: Mutex::new(HashMap::new()),
     });
     let (health, health_service) = tonic_health::server::health_reporter();
     health.set_serving::<BbsServer<Server>>().await;
@@ -104,9 +111,73 @@ struct State {
     /// Inboxes with a `WaitForMail` stream open, as (kind, id).
     waiters: Mutex<HashSet<(i32, i64)>>,
     shutdown: watch::Sender<bool>,
+    require_human_token: bool,
+    auth_failures: Mutex<HashMap<IpAddr, (Instant, u32)>>,
 }
 
 impl State {
+    fn check_auth_rate(&self, peer: Option<IpAddr>) -> Result<(), Status> {
+        let mut failures = self
+            .auth_failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        failures.retain(|_, (since, _)| since.elapsed() < Duration::from_secs(60));
+        if peer.is_some_and(|ip| failures.get(&ip).is_some_and(|(_, count)| *count >= 20))
+            || (failures.len() >= 1024 && peer.is_some_and(|ip| !failures.contains_key(&ip)))
+        {
+            return Err(Status::resource_exhausted(
+                "too many authentication failures; retry after one minute",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn enforce_auth_rate(
+        self: &Arc<Self>,
+        peer: Option<IpAddr>,
+        caller: &Caller,
+    ) -> Result<(), Status> {
+        if let Err(limited) = self.check_auth_rate(peer) {
+            // NAT, proxies and port-forwards can put many humans on one IP.
+            // An invalid client must never lock out authenticated colleagues.
+            let caller = caller.clone();
+            self.call(move |conn| service::whoami(conn, &caller))
+                .await
+                .map_err(|_| limited)?;
+        }
+        Ok(())
+    }
+
+    fn record_auth_failure(&self, peer: Option<IpAddr>, status: &Status) {
+        if status.code() != tonic::Code::Unauthenticated {
+            return;
+        }
+        if let Some(peer) = peer {
+            let mut failures = self
+                .auth_failures
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if failures.len() < 1024 || failures.contains_key(&peer) {
+                let entry = failures.entry(peer).or_insert((Instant::now(), 0));
+                entry.1 = entry.1.saturating_add(1);
+            }
+        }
+    }
+
+    /// Runs independently of message delivery, including blocked channel sends.
+    async fn watch_credentials(self: &Arc<Self>, caller: Arc<Caller>) -> Status {
+        if !self.require_human_token && caller.human_token.is_none() {
+            return std::future::pending().await;
+        }
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let c = caller.clone();
+            if let Err(status) = self.call(move |conn| service::whoami(conn, &c)).await {
+                return status;
+            }
+        }
+    }
+
     async fn stopping(&self) {
         let _ = self
             .shutdown
@@ -127,7 +198,16 @@ impl State {
             if *state.shutdown.borrow() {
                 return Err(Status::unavailable("server is shutting down"));
             }
-            f(&mut conn).map_err(|err| Status::failed_precondition(format!("{err:#}")))
+            f(&mut conn).map_err(|err| {
+                if err
+                    .downcast_ref::<crate::auth::AuthenticationError>()
+                    .is_some()
+                {
+                    Status::unauthenticated(err.to_string())
+                } else {
+                    Status::failed_precondition(format!("{err:#}"))
+                }
+            })
         })
         .await
         .map_err(|err| {
@@ -243,7 +323,7 @@ impl Drop for Slot {
 
 struct Server(Arc<State>);
 
-fn caller<T>(req: &Request<T>) -> Caller {
+fn caller<T>(req: &Request<T>, require_human_token: bool) -> Caller {
     let get = |key| {
         req.metadata()
             .get(key)
@@ -253,6 +333,8 @@ fn caller<T>(req: &Request<T>) -> Caller {
     Caller {
         token: get("bbs-token"),
         human: get("bbs-human"),
+        human_token: get("bbs-human-token"),
+        require_human_token,
     }
 }
 
@@ -276,12 +358,20 @@ impl Server {
         T: Send + 'static,
         F: FnOnce(&mut Connection, &Caller, Req) -> Result<T> + Send + 'static,
     {
-        let caller = Arc::new(caller(&req));
+        let peer = req.remote_addr().map(|addr| addr.ip());
+        let caller = Arc::new(caller(&req, self.0.require_human_token));
+        self.0.enforce_auth_rate(peer, &caller).await?;
+        if self.0.require_human_token && matches!(rpc, "ensure_human" | "add_human") {
+            return Err(Status::permission_denied(
+                "human accounts must be provisioned with local `bbs admin human` commands",
+            ));
+        }
         let req = req.into_inner();
         let c = caller.clone();
         let out = match self.0.call(move |conn| f(conn, &c, req)).await {
             Ok(out) => out,
             Err(status) => {
+                self.0.record_auth_failure(peer, &status);
                 self.0.warn_failed(rpc, &caller, &status).await;
                 return Err(status);
             }
@@ -295,8 +385,51 @@ impl Server {
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
+/// Terminal errors bypass buffered data and never block a producer's cleanup.
+struct CancellableStream<T> {
+    messages: ReceiverStream<Result<T, Status>>,
+    terminal: Option<oneshot::Receiver<Status>>,
+    done: bool,
+}
+
+impl<T> Stream for CancellableStream<T> {
+    type Item = Result<T, Status>;
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::future::Future;
+        use std::task::Poll;
+        let this = self.get_mut();
+        if this.done {
+            return Poll::Ready(None);
+        }
+        if let Some(terminal) = &mut this.terminal {
+            match Pin::new(terminal).poll(cx) {
+                Poll::Ready(Ok(status)) => {
+                    this.done = true;
+                    this.messages.close();
+                    return Poll::Ready(Some(Err(status)));
+                }
+                Poll::Ready(Err(_)) => this.terminal = None,
+                Poll::Pending => {}
+            }
+        }
+        Pin::new(&mut this.messages).poll_next(cx)
+    }
+}
+
 #[tonic::async_trait]
 impl Bbs for Server {
+    async fn server_info(
+        &self,
+        _req: Request<proto::Empty>,
+    ) -> Result<Response<proto::ServerInfoResponse>, Status> {
+        Ok(Response::new(proto::ServerInfoResponse {
+            require_human_token: self.0.require_human_token,
+        }))
+    }
+
     async fn ensure_human(
         &self,
         req: Request<proto::EnsureHumanRequest>,
@@ -433,7 +566,9 @@ impl Bbs for Server {
         &self,
         req: Request<proto::WaitRequest>,
     ) -> Result<Response<Self::WaitForMailStream>, Status> {
-        let caller = caller(&req);
+        let peer = req.remote_addr().map(|addr| addr.ip());
+        let caller = caller(&req, self.0.require_human_token);
+        self.0.enforce_auth_rate(peer, &caller).await?;
         let limit = req.into_inner().limit;
         let c = caller.clone();
         let claim = async {
@@ -445,28 +580,39 @@ impl Bbs for Server {
         let (me, slot) = match claim.await {
             Ok(claimed) => claimed,
             Err(status) => {
+                self.0.record_auth_failure(peer, &status);
                 self.0.warn_failed("wait_for_mail", &caller, &status).await;
                 return Err(status);
             }
         };
         let (tx, rx) = mpsc::channel(16);
+        let (terminal, terminal_rx) = oneshot::channel();
         let state = self.0.clone();
         tokio::spawn(async move {
             let _slot = slot;
             let caller = Arc::new(caller);
             tokio::select! {
                 _ = state.stopping() => {
-                    let _ = tx.send(Err(Status::unavailable("server is shutting down"))).await;
+                    let _ = terminal.send(Status::unavailable("server is shutting down"));
+                },
+                status = state.watch_credentials(caller.clone()) => {
+                    state.record_auth_failure(peer, &status);
+                    let _ = terminal.send(status);
                 },
                 _ = async {
                     if let Err(status) = state.wait(caller.clone(), me, limit, &tx).await {
+                        state.record_auth_failure(peer, &status);
                         state.warn_failed("wait_for_mail", &caller, &status).await;
                         let _ = tx.send(Err(status)).await;
                     }
                 } => {},
             }
         });
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+        Ok(Response::new(Box::pin(CancellableStream {
+            messages: ReceiverStream::new(rx),
+            terminal: Some(terminal_rx),
+            done: false,
+        })))
     }
 
     async fn list_agents(
@@ -483,7 +629,9 @@ impl Bbs for Server {
         &self,
         req: Request<proto::FeedRequest>,
     ) -> Result<Response<Self::WatchFeedStream>, Status> {
-        let caller = Arc::new(caller(&req));
+        let peer = req.remote_addr().map(|addr| addr.ip());
+        let caller = Arc::new(caller(&req, self.0.require_human_token));
+        self.0.enforce_auth_rate(peer, &caller).await?;
         let req = req.into_inner();
         let state = self.0.clone();
         let mut changes = state.notify.subscribe();
@@ -492,11 +640,13 @@ impl Bbs for Server {
         let first = match state.call(move |conn| service::feed(conn, &c, req)).await {
             Ok(first) => first,
             Err(status) => {
+                state.record_auth_failure(peer, &status);
                 state.warn_failed("watch_feed", &caller, &status).await;
                 return Err(status);
             }
         };
         let (tx, rx) = mpsc::channel(4);
+        let (terminal, terminal_rx) = oneshot::channel();
         tokio::spawn(async move {
             let send_snapshots = async {
                 let mut snapshot = Ok(first);
@@ -519,20 +669,28 @@ impl Bbs for Server {
             };
             tokio::select! {
                 _ = state.stopping() => {
-                    let _ = tx.send(Err(Status::unavailable("server is shutting down"))).await;
+                    let _ = terminal.send(Status::unavailable("server is shutting down"));
+                },
+                status = state.watch_credentials(caller.clone()) => {
+                    state.record_auth_failure(peer, &status);
+                    let _ = terminal.send(status);
                 },
                 _ = send_snapshots => {},
             }
         });
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+        Ok(Response::new(Box::pin(CancellableStream {
+            messages: ReceiverStream::new(rx),
+            terminal: Some(terminal_rx),
+            done: false,
+        })))
     }
 
     async fn bind_session(
         &self,
         req: Request<proto::BindSessionRequest>,
     ) -> Result<Response<proto::BindSessionResponse>, Status> {
-        self.unary("bind_session", req, Effect::Write, |c, _, r| {
-            service::bind_session(c, r)
+        self.unary("bind_session", req, Effect::Write, |c, caller, r| {
+            service::bind_session(c, caller, r)
         })
         .await
     }
@@ -541,8 +699,8 @@ impl Bbs for Server {
         &self,
         req: Request<proto::SessionAgentRequest>,
     ) -> Result<Response<proto::SessionAgentResponse>, Status> {
-        self.unary("session_agent", req, Effect::Query, |c, _, r| {
-            service::session_agent(c, r)
+        self.unary("session_agent", req, Effect::Query, |c, caller, r| {
+            service::session_agent(c, caller, r)
         })
         .await
     }
@@ -551,6 +709,26 @@ impl Bbs for Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn terminal_error_bypasses_full_message_buffer() {
+        use tokio_stream::StreamExt;
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(Ok(42)).await.unwrap();
+        let (terminal, terminal_rx) = oneshot::channel();
+        let mut stream = CancellableStream {
+            messages: ReceiverStream::new(rx),
+            terminal: Some(terminal_rx),
+            done: false,
+        };
+        terminal.send(Status::unauthenticated("revoked")).unwrap();
+        assert_eq!(
+            stream.next().await.unwrap().unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
+        assert!(stream.next().await.is_none());
+        assert!(tx.is_closed());
+    }
 
     #[tokio::test]
     async fn shutdown_finishes_active_writes_and_rejects_new_calls() {
@@ -562,6 +740,8 @@ mod tests {
             notify: watch::Sender::new(0),
             waiters: Mutex::new(HashSet::new()),
             shutdown: watch::Sender::new(false),
+            require_human_token: false,
+            auth_failures: Mutex::new(HashMap::new()),
         });
         let (started, active) = tokio::sync::oneshot::channel();
         let (finish, release) = std::sync::mpsc::channel();

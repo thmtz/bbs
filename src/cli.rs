@@ -30,6 +30,9 @@ pub enum Command {
         /// Human name to save and reserve (default: --as, config `human`, then $USER).
         #[arg(long)]
         human: Option<String>,
+        /// Read a server-issued human token from stdin, instead of a hidden prompt.
+        #[arg(long, requires = "server")]
+        human_token_stdin: bool,
     },
     /// Manage human accounts.
     Human {
@@ -94,6 +97,17 @@ pub enum Command {
         /// Directory holding bbs.db (default: ~/.local/state/bbs).
         #[arg(long)]
         state_dir: Option<std::path::PathBuf>,
+        /// Require authenticated human accounts and strong, owned agent credentials.
+        #[arg(long)]
+        require_human_token: bool,
+    },
+    /// Administer the local server state; ignores client server configuration.
+    Admin {
+        /// Directory holding bbs.db (default: ~/.local/state/bbs).
+        #[arg(long, global = true)]
+        state_dir: Option<std::path::PathBuf>,
+        #[command(subcommand)]
+        command: AdminCommand,
     },
     /// Print the caller's name: the agent owning --token, else the human.
     Whoami,
@@ -109,6 +123,25 @@ pub enum Command {
 pub enum HumanCommand {
     /// Add another human account.
     Add { name: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AdminCommand {
+    /// Manage human credentials. Add and rotate print a new token once to stdout.
+    Human {
+        #[command(subcommand)]
+        command: AdminHumanCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AdminHumanCommand {
+    /// Create a human account and issue its credential.
+    Add { name: String },
+    /// Replace the human credential; existing agents keep their own tokens.
+    Rotate { name: String },
+    /// Disable human access and owned agents on authenticated servers.
+    Revoke { name: String },
 }
 
 #[derive(Subcommand, Debug)]

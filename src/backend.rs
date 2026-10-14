@@ -72,13 +72,21 @@ impl Remote {
     /// Wrap `msg` in a request carrying the caller's identity.
     fn request<T>(&self, msg: T) -> Result<tonic::Request<T>> {
         let mut req = tonic::Request::new(msg);
+        if self.caller.token.is_none()
+            && let Some(token) = &self.caller.human_token
+        {
+            req.metadata_mut().insert(
+                "bbs-human-token",
+                MetadataValue::try_from(token.as_str()).context("invalid human token metadata")?,
+            );
+        }
         let (key, value) = match (&self.caller.token, &self.caller.human) {
             (Some(token), _) => ("bbs-token", token),
             (None, Some(human)) => ("bbs-human", human),
             (None, None) => return Ok(req),
         };
         let value = MetadataValue::try_from(value.as_str())
-            .with_context(|| format!("invalid {key} {value:?}"))?;
+            .with_context(|| format!("invalid {key} metadata"))?;
         req.metadata_mut().insert(key, value);
         Ok(req)
     }
@@ -104,8 +112,9 @@ macro_rules! rpc {
 
 impl Backend {
     /// The configured server, else the local database `bbs init` created in `dir`.
-    pub async fn open(config: &Config, dir: &Path, caller: Caller) -> Result<Backend> {
+    pub async fn open(config: &Config, dir: &Path, mut caller: Caller) -> Result<Backend> {
         if let Some(addr) = &config.server {
+            caller.human_token = config.human_token.clone();
             return Ok(Backend::Remote(Remote::connect(addr, caller).await?));
         }
         if !dir.join("bbs.db").exists() {
@@ -152,6 +161,15 @@ impl Backend {
         match self {
             Backend::Local(l) => service::whoami(&mut l.conn, &l.caller),
             Backend::Remote(r) => rpc!(r, whoami, proto::Empty {}),
+        }
+    }
+
+    pub async fn server_info(&mut self) -> Result<proto::ServerInfoResponse> {
+        match self {
+            Backend::Remote(r) => rpc!(r, server_info, proto::Empty {}),
+            Backend::Local(_) => Ok(proto::ServerInfoResponse {
+                require_human_token: false,
+            }),
         }
     }
 
@@ -249,7 +267,7 @@ impl Backend {
         req: proto::BindSessionRequest,
     ) -> Result<proto::BindSessionResponse> {
         match self {
-            Backend::Local(l) => service::bind_session(&mut l.conn, req),
+            Backend::Local(l) => service::bind_session(&mut l.conn, &l.caller, req),
             Backend::Remote(r) => rpc!(r, bind_session, req),
         }
     }
@@ -259,7 +277,7 @@ impl Backend {
         req: proto::SessionAgentRequest,
     ) -> Result<proto::SessionAgentResponse> {
         match self {
-            Backend::Local(l) => service::session_agent(&mut l.conn, req),
+            Backend::Local(l) => service::session_agent(&mut l.conn, &l.caller, req),
             Backend::Remote(r) => rpc!(r, session_agent, req),
         }
     }

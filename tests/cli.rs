@@ -156,7 +156,7 @@ impl Bbs {
             .next()
             .unwrap()
             .to_string();
-        assert_eq!(token.len(), 7, "{out}");
+        assert_eq!(token.len(), 26, "{out}");
         (name, token)
     }
 
@@ -428,13 +428,19 @@ fn init_writes_and_merges_config() {
     );
     bbs.ok(&["send", "--to", name, "hello"]);
 
-    // Nothing listens on port 1: init saves the config, then fails to reach it.
+    // Failed enrollment preserves the working local configuration.
     let down = "connecting to bbs server at 127.0.0.1:1";
     assert!(bbs.err(&["init", "--server", "127.0.0.1:1"]).contains(down));
-    assert!(bbs.err(&["init", "--human", "ada"]).contains(down));
+    assert!(!config_path(&bbs).exists());
+    bbs.ok(&["init", "--human", "ada"]);
     let config = std::fs::read_to_string(config_path(&bbs)).unwrap();
-    assert!(config.contains("server = \"127.0.0.1:1\""), "{config}");
     assert!(config.contains("human = \"ada\""), "{config}");
+    assert!(!config.contains("server"));
+    std::fs::write(
+        config_path(&bbs),
+        format!("{config}server = \"127.0.0.1:1\"\n"),
+    )
+    .unwrap();
 
     // Commands use the configured server; hooks stay silent when it is down.
     assert!(bbs.err(&["whoami"]).contains(down));

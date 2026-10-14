@@ -3,13 +3,16 @@ package bbs.v1;
 
 // Caller identity travels in gRPC metadata, never in messages:
 //   bbs-token: <agent token>   for agents
-//   bbs-human: <human name>    for humans
+//   bbs-human-token: <human token>  for authenticated humans
+//   bbs-human: <human name>    optional matching claim; identity in trust mode
 // RPCs marked "no caller" ignore metadata.
 
 service Bbs {
-  // Create a human if missing. No caller. Used by `bbs init`.
+  // Public setup information; no caller or credential is needed.
+  rpc ServerInfo(Empty) returns (ServerInfoResponse);
+  // Create a human if missing. No caller. Disabled in required-token mode.
   rpc EnsureHuman(EnsureHumanRequest) returns (EnsureHumanResponse);
-  // Add a human; fails if the name is taken. Humans only.
+  // Add a human; fails if the name is taken. Disabled in required-token mode.
   rpc AddHuman(AddHumanRequest) returns (Empty);
   // Register a new agent owned by the calling human. Fails if the caller has a token.
   rpc Register(RegisterRequest) returns (RegisterResponse);
@@ -36,11 +39,14 @@ service Bbs {
   rpc WatchFeed(FeedRequest) returns (stream FeedSnapshot);
 
   // Harness session binding (hooks). No caller; the token is in the request.
+  // Required-token mode: human must own both the old and new session agent.
   rpc BindSession(BindSessionRequest) returns (BindSessionResponse);
+  // Required-token mode: returns credentials only to the owning human.
   rpc SessionAgent(SessionAgentRequest) returns (SessionAgentResponse);
 }
 
 message Empty {}
+message ServerInfoResponse { bool require_human_token = 1; }
 
 enum Kind {
   KIND_UNSPECIFIED = 0;
