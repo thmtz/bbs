@@ -19,7 +19,14 @@ def run(*args, env=None):
     return result.stdout
 
 
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+
 def check(image, bbs):
+    image_user = run("docker", "image", "inspect", "--format", "{{.Config.User}}", image).strip()
+    require(image_user == "999:999", f"expected image USER 999:999, got {image_user!r}")
     with tempfile.TemporaryDirectory(prefix="bbs-container-test-") as temporary:
         env = {key: value for key, value in os.environ.items() if not key.startswith("BBS_")}
         env["HOME"] = temporary
@@ -48,7 +55,7 @@ def check(image, bbs):
         state.chmod(0o777)
         database.chmod(0o666)
         container = run(
-            "docker", "run", "--detach", "--read-only", "--user", "999:999",
+            "docker", "run", "--detach", "--read-only",
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
             "--publish", "127.0.0.1::7777",
             "--mount", f"type=bind,src={state},dst=/var/lib/bbs",
@@ -59,7 +66,7 @@ def check(image, bbs):
             deadline = time.monotonic() + 15
             while True:
                 try:
-                    assert run(bbs, "--as", "tester", "whoami", env=env) == "tester\n"
+                    require(run(bbs, "--as", "tester", "whoami", env=env) == "tester\n", "wrong server identity")
                     break
                 except RuntimeError:
                     if time.monotonic() >= deadline:
@@ -70,17 +77,17 @@ def check(image, bbs):
             for batch in range(4):
                 wait = ["--wait"] if batch == 0 else []
                 output = run(bbs, "--as", "tester", "read", "--limit", "50", *wait, env=env)
-                assert output.count("container-regression-") == 50
+                require(output.count("container-regression-") == 50, "expected 50 unread messages")
                 for number in range(batch * 50, (batch + 1) * 50):
-                    assert f"container-regression-{number:03d}\n" in output
-            assert run(bbs, "--as", "tester", "read", env=env) == ""
+                    require(f"container-regression-{number:03d}\n" in output, f"missing message {number}")
+            require(run(bbs, "--as", "tester", "read", env=env) == "", "inbox was not drained")
             history = run(bbs, "--as", "tester", "read", "--archived", "--limit", "50", env=env)
-            assert history.count("container-regression-") == 50
+            require(history.count("container-regression-") == 50, "expected 50 archived messages")
             logs = subprocess.run(
                 ["docker", "logs", container], capture_output=True, text=True, check=True, timeout=10,
             )
-            assert "serving" in logs.stderr, "server tracing must reach stderr"
-            assert not (state / "bbs.log").exists(), "server must not write a log file"
+            require("serving" in logs.stderr, "server tracing must reach stderr")
+            require(not (state / "bbs.log").exists(), "server must not write a log file")
         except Exception:
             subprocess.run(["docker", "logs", container], check=False, timeout=10)
             raise

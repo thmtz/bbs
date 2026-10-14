@@ -118,7 +118,7 @@ Set the manifest's `image` to the verified digest before applying it. The workfl
 
 ```sh
 docker build -t <registry>/bbs:<tag> . && docker push <registry>/bbs:<tag>
-sed -i 's#ghcr.io/wbbradley/bbs:latest#<registry>/bbs:<tag>#' integrations/kubernetes/bbs-serve.yaml
+sed -i 's#ghcr.io/wbbradley/bbs@sha256:REPLACE_WITH_VERIFIED_DIGEST#<registry>/bbs:<tag>#' integrations/kubernetes/bbs-serve.yaml
 kubectl apply -f integrations/kubernetes/bbs-serve.yaml
 kubectl -n bbs rollout status statefulset/bbs
 ```
