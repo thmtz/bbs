@@ -525,6 +525,95 @@ fn backup_refuses_existing_files_and_cleans_up_failures() {
     }));
 }
 
+#[test]
+fn backup_pins_snapshot_across_copy_steps() {
+    let bbs = Bbs::with_mode("backup-snapshot", Mode::Remote);
+    let (name, _) = bbs.register();
+    bbs.ok(&["send", "--to", &name, "before copy"]);
+    bbs.db()
+        .execute_batch(
+            "CREATE TABLE padding (data BLOB); INSERT INTO padding VALUES (zeroblob(16777216))",
+        )
+        .unwrap();
+    let destination = bbs.home.join("snapshot.db");
+    let child = bbs.spawn(&[
+        "backup",
+        destination.to_str().unwrap(),
+        "--state-dir",
+        bbs.server.as_ref().unwrap().state.to_str().unwrap(),
+    ]);
+    // A partly written temporary database establishes that copying has begun,
+    // without relying on a sleep to guess when the snapshot was acquired.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let copying = std::fs::read_dir(&bbs.home).unwrap().any(|entry| {
+            let entry = entry.unwrap();
+            entry.file_name().to_string_lossy().starts_with(".tmp")
+                && !entry.file_name().to_string_lossy().ends_with("-journal")
+                && entry.metadata().unwrap().len() > 1024 * 1024
+        });
+        if copying {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "backup did not begin copying pages"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    bbs.ok(&["send", "--to", &name, "during copy"]);
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let snapshot = rusqlite::Connection::open(&destination).unwrap();
+    let count: i64 = snapshot
+        .query_row(
+            "SELECT count(*) FROM messages WHERE body = 'during copy'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "writes during copying must not restart the snapshot"
+    );
+    let count: i64 = snapshot
+        .query_row(
+            "SELECT count(*) FROM messages WHERE body = 'before copy'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn backup_refuses_source_sidecar_names() {
+    let bbs = Bbs::new("backup-sidecar");
+    let state = bbs.home.join(".local/state/bbs");
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let destination = state.join(format!("bbs.db{suffix}"));
+        let error = bbs.err(&["backup", destination.to_str().unwrap()]);
+        assert!(
+            error.contains("sidecar") || error.contains("already exists"),
+            "{error}"
+        );
+    }
+    #[cfg(unix)]
+    {
+        let alias = bbs.home.join("state-alias");
+        std::os::unix::fs::symlink(&state, &alias).unwrap();
+        let destination = alias.join("bbs.db-journal");
+        assert!(
+            bbs.err(&["backup", destination.to_str().unwrap()])
+                .contains("source database sidecar")
+        );
+    }
+}
+
 fn config_path(bbs: &Bbs) -> PathBuf {
     bbs.home.join(".config/bbs/config.toml")
 }

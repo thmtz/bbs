@@ -87,6 +87,7 @@ pub fn backup(source: &Path, destination: &Path) -> Result<()> {
     source.busy_timeout(Duration::from_secs(5))?;
     // Pin a read snapshot so ongoing writes do not repeatedly restart the copy.
     source.execute_batch("BEGIN")?;
+    let _: i64 = source.query_row("SELECT count(*) FROM sqlite_schema", [], |r| r.get(0))?;
     let mut target = Connection::open(destination)?;
     {
         let backup = rusqlite::backup::Backup::new(&source, &mut target)?;
