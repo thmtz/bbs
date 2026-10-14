@@ -40,10 +40,15 @@ spec:
     spec:
       terminationGracePeriodSeconds: 10
       securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
         fsGroup: 999 # lets the non-root `bbs` user write the volume
+        seccompProfile: {type: RuntimeDefault}
       containers:
         - name: bbs
-          image: ghcr.io/wbbradley/bbs:latest # build with: docker build -t <image> .
+          # Replace with the verified digest from Actions > Publish image before applying.
+          image: ghcr.io/wbbradley/bbs@sha256:REPLACE_WITH_VERIFIED_DIGEST
           args: ["--listen", "0.0.0.0:7777"]
           ports:
             - name: grpc
@@ -51,6 +56,12 @@ spec:
           env:
             - name: BBS_LOG
               value: info
+            - name: SQLITE_TMPDIR
+              value: /var/lib/bbs
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
           volumeMounts:
             - name: state
               mountPath: /var/lib/bbs
