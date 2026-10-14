@@ -1,6 +1,6 @@
 //! `bbs serve`: a gRPC server over the service layer. It owns the SQLite file;
-//! nothing else may open that file while it runs, because the waiters' notify
-//! only sees commits made through this process.
+//! other processes must not write that file while it runs, because the waiters'
+//! notify only sees commits made through this process. Read-only backups are safe.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;

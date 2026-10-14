@@ -28,7 +28,17 @@ fn display_time(stored: &str) -> String {
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
-    let dir = state_dir()?;
+    let dir = match &cli.command {
+        Command::Serve {
+            state_dir: Some(dir),
+            ..
+        }
+        | Command::Backup {
+            state_dir: Some(dir),
+            ..
+        } => dir.clone(),
+        _ => state_dir()?,
+    };
     match &cli.command {
         Command::Init { server, human } => {
             return init(&dir, server, human, cli.as_human.as_deref()).await;
@@ -36,6 +46,11 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Hook { harness } => return crate::hook::run(*harness, &dir).await,
         Command::Serve { listen, state_dir } => {
             return crate::serve::run(*listen, state_dir.as_deref().unwrap_or(&dir)).await;
+        }
+        Command::Backup { destination, .. } => {
+            crate::backup::run(&dir, destination)?;
+            println!("Backup saved to {}", destination.display());
+            return Ok(());
         }
         _ => {}
     }
@@ -62,7 +77,11 @@ pub async fn run(cli: Cli) -> Result<()> {
 
 async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
     Ok(match command {
-        Command::Init { .. } | Command::Hook { .. } | Command::Serve { .. } | Command::View => {
+        Command::Init { .. }
+        | Command::Hook { .. }
+        | Command::Serve { .. }
+        | Command::Backup { .. }
+        | Command::View => {
             unreachable!()
         }
         Command::Human {

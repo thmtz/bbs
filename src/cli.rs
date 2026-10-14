@@ -97,6 +97,14 @@ pub enum Command {
     },
     /// Print the caller's name: the agent owning --token, else the human.
     Whoami,
+    /// Back up a local server database, including while it is running.
+    Backup {
+        /// New backup file to create; existing files are never overwritten.
+        destination: std::path::PathBuf,
+        /// Directory holding bbs.db (default: ~/.local/state/bbs). Ignores BBS_SERVER.
+        #[arg(long)]
+        state_dir: Option<std::path::PathBuf>,
+    },
     /// List known agents and humans with their last activity.
     Agents {
         /// Include retired agents (humans only).
