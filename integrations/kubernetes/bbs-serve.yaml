@@ -66,12 +66,14 @@ spec:
             - name: state
               mountPath: /var/lib/bbs
           readinessProbe:
-            tcpSocket:
-              port: grpc
+            grpc:
+              port: 7777
+              service: bbs.v1.Bbs
             periodSeconds: 5
           livenessProbe:
-            tcpSocket:
-              port: grpc
+            grpc:
+              port: 7777
+              service: bbs.v1.Bbs
             periodSeconds: 30
           resources:
             requests:
