@@ -364,8 +364,10 @@ cargo install --locked --git https://github.com/wbbradley/bbs --rev <revision> -
 ```
 
 The same coordinated-upgrade and isolated-trial cautions apply as above. A build
-is that official release when `bbs version --json` reports `provenance` `clean`
-and the manifest's `version` and `revision`.
+reports being that release when `bbs version --json` shows `provenance` `clean`
+and the manifest's `version` and `revision`. This is self-reported: a builder can
+set `BBS_BUILD_REVISION` and `BBS_BUILD_DIRTY` on modified source, so it is not
+proof. Install by pinned revision to get the release itself.
 
 ### Coordinated upgrades
 

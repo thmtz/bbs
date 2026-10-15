@@ -25,22 +25,23 @@ jobs:
           target/release/bbs version --manifest > bbs-release.json
           python3 -c 'import json, os, sys; m = json.load(open("bbs-release.json")); sys.exit(m["revision"] != os.environ["GITHUB_SHA"])'
           cat bbs-release.json
-      - name: Refuse an existing version
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          tag=$(python3 -c 'import json; print(json.load(open("bbs-release.json"))["tag"])')
-          echo "TAG=$tag" >> "$GITHUB_ENV"
-          tagged=$(git ls-remote --tags origin "refs/tags/$tag")
-          releases=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName --jq '.[].tagName')
-          if [ -n "$tagged" ] || grep -qxF "$tag" <<< "$releases"; then
-            echo "::error::$tag is already tagged or released; bump the package version to publish $GITHUB_SHA."
-            exit 1
-          fi
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          tag=$(python3 -c 'import json; print(json.load(open("bbs-release.json"))["tag"])')
+          leftover="if an earlier run failed, delete its leftover $tag tag or draft release; otherwise bump the package version to publish $GITHUB_SHA."
+          releases=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName --jq '.[].tagName')
+          if grep -qxF "$tag" <<< "$releases"; then
+            echo "::error::A $tag release or draft already exists; $leftover"
+            exit 1
+          fi
+          # Creating the ref fails if the tag exists, so the release can only
+          # land on GITHUB_SHA.
+          if ! gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$tag" -f sha="$GITHUB_SHA" > /dev/null; then
+            echo "::error::Could not create tag $tag; $leftover"
+            exit 1
+          fi
           cat > notes.md <<NOTES
           Source revision \`$GITHUB_SHA\`. Install this release's client with:
 
@@ -50,6 +51,6 @@ jobs:
 
           \`bbs-release.json\` lists its protocol, schema, config format and minimum Rust version.
           NOTES
-          gh release create "$TAG" bbs-release.json --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" --title "bbs $TAG" --notes-file notes.md
-          echo "Published [$TAG]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG) at \`$GITHUB_SHA\`." >> "$GITHUB_STEP_SUMMARY"
+          gh release create "$tag" bbs-release.json --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --title "bbs $tag" --notes-file notes.md
+          echo "Published [$tag]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$tag) at \`$GITHUB_SHA\`." >> "$GITHUB_STEP_SUMMARY"
