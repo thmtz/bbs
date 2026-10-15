@@ -207,6 +207,37 @@ fn validate_group_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Unicode format characters (general category Cf): bidi overrides and
+/// isolates, zero-width spaces and joiners, the BOM, and tag characters. They
+/// render invisibly and can make a description display differently from its
+/// stored text.
+fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
+}
+
 /// A trimmed, single-line description within the length limit.
 fn validate_group_description(description: &str) -> Result<&str> {
     let description = description.trim();
@@ -215,9 +246,11 @@ fn validate_group_description(description: &str) -> Result<&str> {
     }
     if description
         .chars()
-        .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+        .any(|c| c.is_control() || is_format_char(c) || matches!(c, '\u{2028}' | '\u{2029}'))
     {
-        bail!("group description must be one line without control characters");
+        bail!(
+            "group description must be one line without control or invisible formatting characters"
+        );
     }
     let chars = description.chars().count();
     if chars > MAX_GROUP_DESCRIPTION_CHARS {

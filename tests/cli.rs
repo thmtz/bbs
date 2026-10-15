@@ -1343,6 +1343,9 @@ fn groups_carry_human_written_descriptions(mode: Mode) {
         ("two\nlines".to_string(), "one line"),
         ("tab\there".to_string(), "one line"),
         ("line\u{2028}separator".to_string(), "one line"),
+        ("evil\u{202E}txt.exe".to_string(), "invisible formatting"),
+        ("zero\u{200B}width".to_string(), "invisible formatting"),
+        ("tag\u{E0041}char".to_string(), "invisible formatting"),
     ] {
         assert!(
             bbs.err(&["group", "describe", "plain", &bad]).contains(why),
@@ -1356,6 +1359,9 @@ fn groups_carry_human_written_descriptions(mode: Mode) {
     }
     assert!(!bbs.ok(&["group", "list"]).contains("@fresh"));
     assert!(bbs.ok(&["group", "list"]).contains(&format!("  {max}\n")));
+    bbs.ok(&["group", "describe", "plain", "-1 means off"]);
+    assert!(bbs.ok(&["group", "list"]).contains("  -1 means off\n"));
+    bbs.ok(&["group", "describe", "plain", &max]);
     assert!(
         bbs.err(&["group", "describe", "missing", "x"])
             .contains("no such group")

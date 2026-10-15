@@ -19,7 +19,8 @@ request that bumps the package version; correct the date if publishing slips.
   `bbs group describe <group> "..." | --clear` (humans only) set one line on what
   a group is for, shown indented under the group in `bbs group list`. Requires a
   server advertising `group-description.v1`; older servers refuse rather than
-  drop the description. Schema 7.
+  drop the description. Schema 7: earlier binaries cannot open an upgraded
+  database, so back it up before upgrading the server (#32).
 
 ### Changed
 

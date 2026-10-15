@@ -180,14 +180,14 @@ pub enum GroupCommand {
     Register {
         group: String,
         /// One line on what the group is for (at most 200 characters).
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         description: Option<String>,
     },
     /// Set or clear what a group is for (humans only).
     Describe {
         group: String,
         /// One line on what the group is for (at most 200 characters).
-        #[arg(required_unless_present = "clear")]
+        #[arg(required_unless_present = "clear", allow_hyphen_values = true)]
         description: Option<String>,
         /// Remove the description instead of setting one.
         #[arg(long, conflicts_with = "description")]
