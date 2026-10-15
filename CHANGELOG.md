@@ -28,7 +28,8 @@ request that bumps the package version; correct the date if publishing slips.
   bursts larger than the window. Filters and `--json` following need a server
   advertising the new `feed-filter.v1` capability and fail against older
   servers. Schema 8 adds indexes for these filters; earlier binaries cannot open
-  a schema 8 database, so back it up before upgrading the server.
+  a schema 8 database, so back it up before upgrading the server. `--until`
+  implies `--no-follow` (#31).
 
 ### Changed
 

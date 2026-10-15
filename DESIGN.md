@@ -219,10 +219,15 @@ than clamping it. An older server would ignore the filter fields, so the client
 requires `feed-filter.v1` whenever one is set. The caller's scope uses delivery
 rows, so group mail counts by membership at send time. Names are resolved to
 ids first and only the filters present reach the SQL. An any-of filter (sender
-name, a human with their agents, the caller's scope) runs one indexed walk per
-principal or delivery recipient, each stopping after `backlog` rows, and merges
-them, so dense and sparse matches both avoid scanning the message table. The
-supporting indexes come from migration 0008 (schema 8).
+name, a human with their agents, the caller's scope, a group name reused across
+archived groups) runs one indexed walk per principal, delivery recipient, or
+group, each stopping after `backlog` rows, and merges them; none scans the whole
+message table. The one walk not bounded by its own matches is the scope's
+direct messages to the human: it reads human-sent direct messages
+(`messages_human_dm`) until it finds `backlog` delivered to the caller, which
+stays small because agents cannot message humans. The supporting indexes come
+from migration 0008 (schema 8). `--until` implies `--no-follow`: following a
+window bounded in the past would wait forever for messages that cannot match.
 
 Snapshots re-send the whole window, which suits the TUI. A request with
 `after_id` is a cursor instead: each snapshot is the next batch of at most

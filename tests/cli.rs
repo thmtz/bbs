@@ -2046,6 +2046,24 @@ fn view_filters_by_group_sender_owner_and_scope(mode: Mode) {
     assert!(group.iter().all(|r| r["group"] == "acme"), "{group:?}");
     assert!(bodies(&group).contains(&"acme from A"));
 
+    // A reused group name covers every incarnation, archived or active.
+    bbs.ok(&["group", "register", "temp"]);
+    bbs.ok(&["send", "--to", "@temp", "first temp"]);
+    bbs.ok(&["group", "delete", "temp"]);
+    bbs.ok(&["group", "register", "temp"]);
+    bbs.ok(&["send", "--to", "@temp", "second temp"]);
+    let temp = view_json(&bbs, &["--group", "temp", "--from", "will"]);
+    assert_eq!(
+        bodies(&temp),
+        [
+            "first temp",
+            "Human \"will\" archived group @temp.",
+            "second temp"
+        ]
+    );
+    let last = view_json(&bbs, &["--group", "temp", "--limit", "1"]);
+    assert_eq!(bodies(&last), ["second temp"]);
+
     let from = view_json(&bbs, &["--from", &a.to_lowercase()]);
     assert!(from.iter().all(|r| r["from"] == a.as_str()), "{from:?}");
     assert!(bodies(&from).contains(&"acme from A"));
@@ -2163,6 +2181,26 @@ fn view_since_and_until_bound_history(mode: Mode) {
     assert_eq!(window(&["--until", "1h"]), ["january", "february", "march"]);
     // A window older than the default backlog is reachable by time.
     assert_eq!(window(&["--until", "2026-02-01T00:00:00Z"]), ["january"]);
+    // --until never follows: a window bounded in the past cannot grow, and the
+    // TUI is not needed to print it.
+    for args in [
+        &["view", "--json", "--until", "1h"][..],
+        &["view", "--until", "2099-01-01T00:00:00Z"],
+    ] {
+        let mut child = bbs.spawn(args);
+        let status = wait_exit(&mut child, 10).unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("{args:?} kept following")
+        });
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert!(stdout.contains("march"), "{args:?}: {stdout}");
+    }
     assert!(
         bbs.err(&["view", "--json", "--since", "soon"])
             .contains("invalid --since \"soon\"")

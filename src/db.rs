@@ -883,6 +883,8 @@ enum Term {
     /// A direct message to this human. Agents cannot message humans, so only
     /// human-sent direct messages qualify.
     DirectTo(i64),
+    /// A broadcast to this group.
+    ToGroup(i64),
 }
 
 /// Which any-of filter is expanded into terms; the others stay predicates.
@@ -892,6 +894,7 @@ enum Expanded {
     Senders,
     FromHuman,
     Scope,
+    Groups,
 }
 
 const OWNED_AGENTS: &str = "SELECT agent_id FROM agent_owners WHERE human_id = ?";
@@ -906,7 +909,11 @@ fn feed_predicates(filter: &FeedFilter, expanded: Expanded) -> (String, Args) {
         args.extend(ids.map(Value::Integer));
         vec!["?"; args.len() - n].join(", ")
     };
-    if let Some(ids) = &filter.group_ids {
+    if let Some(ids) = filter
+        .group_ids
+        .as_ref()
+        .filter(|_| expanded != Expanded::Groups)
+    {
         clauses.push(format!(
             "m.to_group_id IN ({})",
             list(&mut args, &mut ids.iter().copied())
@@ -1028,6 +1035,13 @@ fn term_sql(term: Term, limit: u32, filter: &FeedFilter, expanded: Expanded) -> 
             ),
             vec![Value::Integer(agent)],
         ),
+        Term::ToGroup(group) => (
+            format!(
+                "SELECT m.id FROM messages m WHERE m.to_group_id = ?{predicates}
+                 ORDER BY m.id {dir} LIMIT ?"
+            ),
+            vec![Value::Integer(group)],
+        ),
         Term::DirectTo(human) => (
             format!(
                 "SELECT m.id FROM messages m INDEXED BY messages_human_dm
@@ -1062,6 +1076,12 @@ fn page_ids(conn: &Connection, limit: u32, filter: &FeedFilter) -> Result<Vec<i6
             terms.extend([Term::Sent(Kind::Agent, agent), Term::DeliveredTo(agent)]);
         }
         (Expanded::Scope, terms)
+    } else if let Some(ids) = filter.group_ids.as_ref().filter(|ids| ids.len() > 1) {
+        // A reused group name: one walk per incarnation avoids sorting them all.
+        (
+            Expanded::Groups,
+            ids.iter().map(|&g| Term::ToGroup(g)).collect(),
+        )
     } else {
         let (sql, args) = page_sql(limit, filter);
         return Ok(conn
@@ -1366,10 +1386,18 @@ mod tests {
                 term_sql(Term::DirectTo(1), 200, &mine, Expanded::Scope),
                 "messages_human_dm",
             ),
+            (
+                term_sql(Term::ToGroup(1), 200, &mine, Expanded::Groups),
+                "messages_group",
+            ),
         ];
         for (sql, index) in cases {
             let plan = plan(sql);
             assert!(!plan.iter().any(|l| l == "SCAN m"), "{index}: {plan:?}");
+            assert!(
+                !plan.iter().any(|l| l.contains("TEMP B-TREE")),
+                "{index}: {plan:?}"
+            );
             assert!(plan.iter().any(|l| l.contains(index)), "{index}: {plan:?}");
         }
     }

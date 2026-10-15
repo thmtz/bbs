@@ -168,6 +168,7 @@ pub struct ViewArgs {
     #[arg(long)]
     pub since: Option<String>,
     /// Only messages sent before this time (RFC3339, or a duration like 2h, 7d).
+    /// Implies --no-follow: new messages always fall after it.
     #[arg(long)]
     pub until: Option<String>,
     /// Size of the history window: the most recent N matching messages (default 200).

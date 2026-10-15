@@ -24,19 +24,21 @@ const BACKLOG: u32 = 200;
 const KEY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 pub async fn run(backend: &mut Backend, args: ViewArgs) -> Result<()> {
-    let tui = !args.json && !args.no_follow;
+    // Nothing sent from now on is before an --until bound, so following one
+    // would wait forever: --until prints the history and exits.
+    let follow = !args.no_follow && args.until.is_none();
+    let tui = !args.json && follow;
     if tui && !(std::io::stdout().is_terminal() && std::io::stdin().is_terminal()) {
         bail!("bbs view needs a terminal; use --json or --no-follow for plain output");
     }
     let req = request(&args, Utc::now())?;
-    let follow_json = args.json && !args.no_follow;
     if args.json {
-        return stream_json(backend, req, follow_json).await;
+        return stream_json(backend, req, follow).await;
     }
     let mut feed = backend.watch_feed(req, false).await?;
     // Fetch before taking over the terminal, so a refusal prints normally.
     let rows = feed.next().await?;
-    if args.no_follow {
+    if !follow {
         write_out(&format_feed(&rows))?;
         return Ok(());
     }
