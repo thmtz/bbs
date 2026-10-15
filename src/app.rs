@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 
 use crate::backend::{Backend, Local, Remote};
 use crate::cli::{Cli, Command, GroupCommand, HumanCommand};
@@ -95,9 +96,15 @@ pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::View => crate::view::run(&mut backend).await,
         Command::Read {
-            limit, wait: true, ..
+            limit,
+            wait: true,
+            json,
+            ..
         } => {
-            print!("{}", format_messages(&backend.wait_for_mail(limit).await?)?);
+            print!(
+                "{}",
+                format_messages(&backend.wait_for_mail(limit).await?, json)?
+            );
             Ok(())
         }
         command => {
@@ -154,7 +161,9 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
                 let r = backend.group_remove(req).await?;
                 format!("Removed {} from @{}.\n", r.agent, r.group)
             }
-            GroupCommand::List => format_groups(&backend.group_list().await?.groups)?,
+            GroupCommand::List { json } => {
+                format_groups(&backend.group_list().await?.groups, json)?
+            }
         },
         Command::Register { name, note } => {
             let req = proto::RegisterRequest {
@@ -192,6 +201,7 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
             limit,
             archived,
             since,
+            json,
             ..
         } => {
             let req = proto::ReadRequest {
@@ -200,14 +210,18 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
                 since: since.map(|s| parse_since(&s, Utc::now())).transpose()?,
                 from_kind: None,
             };
-            format_messages(&backend.read(req).await?.messages)?
+            format_messages(&backend.read(req).await?.messages, json)?
         }
         Command::Whoami => format!("{}\n", backend.whoami().await?.name),
-        Command::Agents { all } => {
+        Command::Agents { all, json } => {
             let r = backend
                 .list_agents(proto::ListAgentsRequest { all })
                 .await?;
-            format_agents(&r)
+            if json {
+                agents_json(&r)?
+            } else {
+                format_agents(&r)
+            }
         }
     })
 }
@@ -286,7 +300,67 @@ async fn init(
     Ok(())
 }
 
-fn format_groups(groups: &[proto::Group]) -> Result<String> {
+/// One JSON object per line. Every field is always present; absent values are
+/// null. Names are bare (no `@`), timestamps are stored RFC3339 UTC strings.
+fn json_lines<T: Serialize>(items: impl IntoIterator<Item = T>) -> Result<String> {
+    let mut out = String::new();
+    for item in items {
+        out.push_str(&serde_json::to_string(&item)?);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+#[derive(Serialize)]
+struct GroupJson<'a> {
+    name: &'a str,
+    members: &'a [String],
+}
+
+#[derive(Serialize)]
+struct MessageJson<'a> {
+    id: i64,
+    created_at: &'a str,
+    from: &'a str,
+    from_kind: &'static str,
+    /// The sending agent's human; null for humans and unknown owners.
+    from_owner: Option<&'a str>,
+    /// Direct recipient; null for broadcasts.
+    to: Option<&'a str>,
+    /// Broadcast group; null for direct messages.
+    group: Option<&'a str>,
+    body: &'a str,
+}
+
+#[derive(Serialize)]
+struct AgentJson<'a> {
+    name: &'a str,
+    kind: &'static str,
+    retired: bool,
+    owner: Option<&'a str>,
+    /// Null for humans, who receive every group broadcast.
+    groups: Option<&'a [String]>,
+    active_at: &'a str,
+    hostname: Option<&'a str>,
+    pwd: Option<&'a str>,
+    status: Option<&'a str>,
+}
+
+fn kind_name(kind: proto::Kind) -> &'static str {
+    match kind {
+        proto::Kind::Agent => "agent",
+        proto::Kind::Human => "human",
+        proto::Kind::Unspecified => "unspecified",
+    }
+}
+
+fn format_groups(groups: &[proto::Group], json: bool) -> Result<String> {
+    if json {
+        return json_lines(groups.iter().map(|g| GroupJson {
+            name: &g.name,
+            members: &g.members,
+        }));
+    }
     let mut out = String::new();
     for g in groups {
         let members = if g.members.is_empty() {
@@ -330,7 +404,19 @@ fn parse_since(s: &str, now: DateTime<Utc>) -> Result<String> {
     Ok(fmt_time(now - chrono::Duration::from_std(d)?))
 }
 
-pub(crate) fn format_messages(msgs: &[proto::Message]) -> Result<String> {
+fn format_messages(msgs: &[proto::Message], json: bool) -> Result<String> {
+    if json {
+        return json_lines(msgs.iter().map(|m| MessageJson {
+            id: m.id,
+            created_at: &m.created_at,
+            from: &m.from_name,
+            from_kind: kind_name(m.from_kind()),
+            from_owner: m.from_owner.as_deref(),
+            to: m.to_name.as_deref(),
+            group: m.to_group.as_deref(),
+            body: &m.body,
+        }));
+    }
     let mut out = String::new();
     for (i, m) in msgs.iter().enumerate() {
         if i > 0 {
@@ -355,6 +441,32 @@ pub(crate) fn format_messages(msgs: &[proto::Message]) -> Result<String> {
         out.push('\n');
     }
     Ok(out)
+}
+
+fn agents_json(r: &proto::ListAgentsResponse) -> Result<String> {
+    let humans = r.humans.iter().map(|h| AgentJson {
+        name: &h.name,
+        kind: "human",
+        retired: false,
+        owner: None,
+        groups: None,
+        active_at: &h.active_at,
+        hostname: None,
+        pwd: None,
+        status: None,
+    });
+    let agents = r.agents.iter().map(|a| AgentJson {
+        name: &a.name,
+        kind: "agent",
+        retired: a.retired,
+        owner: a.owner.as_deref(),
+        groups: Some(&a.groups),
+        active_at: &a.active_at,
+        hostname: Some(&a.hostname),
+        pwd: Some(&a.pwd),
+        status: a.status.as_deref(),
+    });
+    json_lines(humans.chain(agents))
 }
 
 fn format_agents(r: &proto::ListAgentsResponse) -> String {
