@@ -1963,7 +1963,255 @@ fn old_schema_is_migrated_on_open_even_concurrently() {
 fn view_is_for_humans_only(mode: Mode) {
     let bbs = Bbs::with_mode("view", mode);
     let (_a, ta) = bbs.register();
-    assert!(bbs.err(&["--token", &ta, "view"]).contains("humans only"));
+    for args in [&["view", "--no-follow"][..], &["view", "--json"]] {
+        let mut args = args.to_vec();
+        args.splice(0..0, ["--token", ta.as_str()]);
+        assert!(bbs.err(&args).contains("humans only"));
+    }
+    // The TUI refuses to start without a terminal instead of garbling a pipe.
+    assert!(bbs.err(&["view"]).contains("needs a terminal"));
+}
+
+/// `bbs view --json --no-follow` with `args`, parsed.
+fn view_json(bbs: &Bbs, args: &[&str]) -> Vec<serde_json::Value> {
+    let mut all = vec!["view", "--json", "--no-follow"];
+    all.extend_from_slice(args);
+    bbs.ok(&all)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+fn bodies(rows: &[serde_json::Value]) -> Vec<&str> {
+    rows.iter().map(|r| r["body"].as_str().unwrap()).collect()
+}
+
+fn view_filters_by_group_sender_owner_and_scope(mode: Mode) {
+    let bbs = Bbs::with_mode("view-filters", mode);
+    bbs.ok(&["human", "add", "ada"]);
+    for g in ["acme", "beta", "gamma"] {
+        bbs.ok(&["group", "register", g]);
+    }
+    // will owns A (acme) and B (beta); ada owns C (acme) and D (beta, gamma).
+    let (a, ta) = bbs.register();
+    let (_b, tb) = bbs.register();
+    let (c, tc) = bbs.register_with(&["--as", "ada", "register"]);
+    let (d, td) = bbs.register_with(&["--as", "ada", "register"]);
+    for (token, group) in [(&ta, "acme"), (&tb, "beta"), (&tc, "acme")] {
+        bbs.ok(&["--token", token, "group", "join", group]);
+    }
+    bbs.ok(&["--token", &td, "group", "join", "beta"]);
+    bbs.ok(&["--token", &td, "group", "join", "gamma"]);
+
+    bbs.ok(&["--token", &ta, "send", "--to", "@acme", "acme from A"]);
+    bbs.ok(&["--token", &td, "send", "--to", "@beta", "beta from D"]);
+    bbs.ok(&["--token", &tc, "send", "--to", &a, "dm C to A"]);
+    bbs.ok(&["--as", "ada", "send", "--to", &d, "ada to D"]);
+    bbs.ok(&["send", "--to", "ada", "will to ada"]);
+    bbs.ok(&["--as", "ada", "send", "--to", "will", "ada to will"]);
+    bbs.ok(&["--token", &td, "send", "--to", "@gamma", "gamma before B"]);
+    bbs.ok(&["--token", &tb, "group", "join", "gamma"]);
+    bbs.ok(&["--token", &td, "send", "--to", "@gamma", "gamma after B"]);
+
+    let all = view_json(&bbs, &[]);
+    let ids: Vec<i64> = all.iter().map(|r| r["id"].as_i64().unwrap()).collect();
+    assert!(ids.windows(2).all(|w| w[0] < w[1]), "oldest first: {ids:?}");
+    let acme = &all[bodies(&all)
+        .iter()
+        .position(|b| *b == "acme from A")
+        .unwrap()];
+    assert_eq!(
+        acme,
+        &serde_json::json!({
+            "id": acme["id"], "created_at": acme["created_at"], "from": a,
+            "from_kind": "agent", "from_owner": "will", "to": null,
+            "group": "acme", "body": "acme from A", "read_at": null,
+        })
+    );
+    let dm = &all[bodies(&all)
+        .iter()
+        .position(|b| *b == "ada to will")
+        .unwrap()];
+    assert_eq!(
+        (&dm["from_kind"], &dm["from_owner"], &dm["to"], &dm["group"]),
+        (
+            &serde_json::json!("human"),
+            &serde_json::Value::Null,
+            &serde_json::json!("will"),
+            &serde_json::Value::Null
+        )
+    );
+
+    let group = view_json(&bbs, &["--group", "@acme"]);
+    assert!(group.iter().all(|r| r["group"] == "acme"), "{group:?}");
+    assert!(bodies(&group).contains(&"acme from A"));
+
+    let from = view_json(&bbs, &["--from", &a.to_lowercase()]);
+    assert!(from.iter().all(|r| r["from"] == a.as_str()), "{from:?}");
+    assert!(bodies(&from).contains(&"acme from A"));
+
+    let ada = view_json(&bbs, &["--from", "@ada"]);
+    let senders: std::collections::HashSet<&str> =
+        ada.iter().map(|r| r["from"].as_str().unwrap()).collect();
+    assert_eq!(
+        senders,
+        ["ada", c.as_str(), d.as_str()].into_iter().collect(),
+        "{ada:?}"
+    );
+
+    // will's scope: own and own agents' mail, DMs to will or will's agents, and
+    // group mail delivered to will's agents (membership at send time).
+    let mine = bodies(&view_json(&bbs, &["--mine"]))
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    for body in [
+        "acme from A",
+        "beta from D",
+        "dm C to A",
+        "will to ada",
+        "ada to will",
+        "gamma after B",
+    ] {
+        assert!(mine.iter().any(|m| m == body), "{body} missing: {mine:?}");
+    }
+    for body in ["ada to D", "gamma before B"] {
+        assert!(!mine.iter().any(|m| m == body), "{body} leaked: {mine:?}");
+    }
+    // Filters compose with each other and with --limit.
+    let mine_gamma = view_json(&bbs, &["--mine", "--group", "gamma"]);
+    assert!(bodies(&mine_gamma).contains(&"gamma after B"));
+    assert!(!bodies(&mine_gamma).contains(&"gamma before B"));
+    let last = view_json(&bbs, &["--from", "@ada", "--limit", "2"]);
+    assert_eq!(bodies(&last), ["gamma before B", "gamma after B"]);
+    // ada's scope is computed for ada.
+    let ada_mine = bodies(&view_json(&bbs, &["--as", "ada", "--mine"]))
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    for body in ["gamma before B", "acme from A", "ada to D", "will to ada"] {
+        assert!(ada_mine.iter().any(|m| m == body), "{body}: {ada_mine:?}");
+    }
+
+    // Plain text names owner, target, and read state.
+    let text = bbs.ok(&["view", "--no-follow", "--from", "@ada", "--limit", "4"]);
+    assert!(
+        text.contains("from ada (human) to will (unread):\nada to will"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("from {d}@ada to @gamma:\ngamma after B")),
+        "{text}"
+    );
+    bbs.ok(&["read"]);
+    let text = bbs.ok(&["view", "--no-follow", "--from", "ada", "--limit", "1"]);
+    assert!(text.contains("to will (read 20"), "{text}");
+
+    // Unknown names fail loudly rather than matching nothing.
+    assert!(
+        bbs.err(&["view", "--json", "--group", "nope"])
+            .contains("no such group @nope")
+    );
+    assert!(
+        bbs.err(&["view", "--json", "--from", "Nobody"])
+            .contains("no agent or human named \"Nobody\"")
+    );
+    assert!(
+        bbs.err(&["view", "--json", "--from", "@nobody"])
+            .contains("unknown human \"nobody\"")
+    );
+    assert!(
+        bbs.err(&["view", "--json", "--limit", "0"])
+            .contains("1..=1000")
+    );
+}
+
+fn view_since_and_until_bound_history(mode: Mode) {
+    let bbs = Bbs::with_mode("view-time", mode);
+    let (a, _ta) = bbs.register();
+    for body in ["january", "february", "march", "now"] {
+        bbs.ok(&["send", "--to", &a, body]);
+    }
+    bbs.db()
+        .execute_batch(
+            "UPDATE messages SET created_at = '2026-01-10T00:00:00.000000Z' WHERE body = 'january';
+             UPDATE messages SET created_at = '2026-02-10T00:00:00.000000Z' WHERE body = 'february';
+             UPDATE messages SET created_at = '2026-03-10T00:00:00.000000Z' WHERE body = 'march';",
+        )
+        .unwrap();
+    let window = |args: &[&str]| -> Vec<String> {
+        bodies(&view_json(&bbs, args))
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(
+        window(&[
+            "--since",
+            "2026-02-01T00:00:00Z",
+            "--until",
+            "2026-03-10T00:00:00Z"
+        ]),
+        ["february"],
+        "since is inclusive, until exclusive"
+    );
+    assert_eq!(
+        window(&["--since", "2026-02-10T01:00:00+01:00"]),
+        ["february", "march", "now"]
+    );
+    assert_eq!(window(&["--since", "1h"]), ["now"]);
+    assert_eq!(window(&["--until", "1h"]), ["january", "february", "march"]);
+    // A window older than the default backlog is reachable by time.
+    assert_eq!(window(&["--until", "2026-02-01T00:00:00Z"]), ["january"]);
+    assert!(
+        bbs.err(&["view", "--json", "--since", "soon"])
+            .contains("invalid --since \"soon\"")
+    );
+    assert!(
+        bbs.err(&["view", "--json", "--since", "1h", "--until", "2h"])
+            .contains("must be earlier than until")
+    );
+}
+
+fn view_json_follow_emits_each_message_once(mode: Mode) {
+    let bbs = Bbs::with_mode("view-follow", mode);
+    let (a, ta) = bbs.register();
+    let (_b, _tb) = bbs.register();
+    bbs.ok(&["send", "--to", &a, "history"]);
+    let mut child = bbs.spawn(&["view", "--json", "--from", "will"]);
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { return };
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let next = || -> serde_json::Value {
+        let line = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("view --json emitted a line");
+        serde_json::from_str(&line).unwrap()
+    };
+    assert_eq!(next()["body"], "history");
+
+    bbs.ok(&["send", "--to", &a, "live one"]);
+    assert_eq!(next()["body"], "live one");
+    // Reading changes read_at and re-sends the window; nothing is repeated.
+    bbs.ok(&["--token", &ta, "read"]);
+    // A non-matching sender produces a snapshot but no line.
+    bbs.ok(&["group", "register", "acme"]);
+    bbs.ok(&["--token", &ta, "group", "join", "acme"]);
+    bbs.ok(&["--token", &ta, "send", "--to", "@acme", "x"]);
+    bbs.ok(&["send", "--to", &a, "live two"]);
+    assert_eq!(next()["body"], "live two");
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    let _ = child.kill();
+    let _ = child.wait();
+    let extra: Vec<String> = rx.try_iter().collect();
+    assert!(extra.is_empty(), "duplicate or stray lines: {extra:?}");
 }
 
 both_modes!(
@@ -1996,4 +2244,7 @@ both_modes!(
     only_one_read_wait_per_inbox,
     read_wait_fails_if_retired_while_waiting,
     view_is_for_humans_only,
+    view_filters_by_group_sender_owner_and_scope,
+    view_since_and_until_bound_history,
+    view_json_follow_emits_each_message_once,
 );

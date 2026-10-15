@@ -750,11 +750,7 @@ pub fn read(
             let since = req
                 .since
                 .as_deref()
-                .map(|s| {
-                    DateTime::parse_from_rfc3339(s)
-                        .map(|t| fmt_time(t.with_timezone(&Utc)))
-                        .with_context(|| format!("invalid since {s:?}: expected RFC3339"))
-                })
+                .map(|s| parse_time("since", s))
                 .transpose()?;
             db::archived_since(ctx.conn, &me, since.as_deref(), req.limit)?
         } else {
@@ -826,16 +822,67 @@ pub fn list_agents(
     })
 }
 
-/// The most recent `backlog` messages across the whole board, oldest first.
-/// Humans only; never archives anything.
+/// Normalize a client-supplied RFC3339 time to the stored fixed-width form.
+fn parse_time(field: &str, s: &str) -> Result<String> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|t| fmt_time(t.with_timezone(&Utc)))
+        .with_context(|| format!("invalid {field} {s:?}: expected RFC3339"))
+}
+
+/// The most recent `backlog` messages matching the request's filters, oldest
+/// first. Humans only; never archives anything. Unknown names fail loudly
+/// rather than matching nothing.
 pub fn feed(
     conn: &mut Connection,
     caller: &Caller,
     req: proto::FeedRequest,
 ) -> Result<proto::FeedSnapshot> {
     with_ctx(conn, caller, |ctx| {
-        ctx.human()?;
-        let messages = db::recent_messages(ctx.conn, req.backlog)?
+        let me = ctx.human()?;
+        let group = req.group.as_deref().map(group_name);
+        if let Some(group) = group
+            && !db::group_name_exists(ctx.conn, group)?
+        {
+            bail!("no such group @{group}");
+        }
+        if let Some(from) = req.from.as_deref()
+            && !db::sender_name_exists(ctx.conn, from)?
+        {
+            bail!("no agent or human named {from:?}");
+        }
+        let from_human = req
+            .from_human
+            .as_deref()
+            .map(|name| {
+                db::find_human(ctx.conn, name)?
+                    .map(|h| h.id)
+                    .with_context(|| format!("unknown human {name:?}"))
+            })
+            .transpose()?;
+        let since = req
+            .since
+            .as_deref()
+            .map(|s| parse_time("since", s))
+            .transpose()?;
+        let until = req
+            .until
+            .as_deref()
+            .map(|s| parse_time("until", s))
+            .transpose()?;
+        if let (Some(since), Some(until)) = (&since, &until)
+            && since >= until
+        {
+            bail!("since ({since}) must be earlier than until ({until})");
+        }
+        let filter = db::FeedFilter {
+            group,
+            from: req.from.as_deref(),
+            from_human,
+            since: since.as_deref(),
+            until: until.as_deref(),
+            scope: req.mine.then_some(me.id),
+        };
+        let messages = db::recent_messages(ctx.conn, req.backlog, &filter)?
             .into_iter()
             .map(|m| message(m, None))
             .collect();

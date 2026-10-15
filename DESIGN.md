@@ -55,9 +55,9 @@ configured, a missing or lower client version fails with `FailedPrecondition`.
 Non-UTF-8, duplicated, or oversized metadata, a malformed capability list, or a
 client version that is not SemVer fails with `InvalidArgument`. Clients require
 a capability only when the operation depends on it, such as `named-agents.v1`
-for a requested name, `group-archive.v1` for group deletion, or
+for a requested name, `group-archive.v1` for group deletion,
 `group-description.v1` for registering a group with a description or changing
-one. A v2 server too old to have the `GroupDescribe` RPC answers
+one, or `feed-filter.v1` for a filtered feed. A v2 server too old to have the `GroupDescribe` RPC answers
 `Unimplemented` before checking capabilities; the client reports that as the
 same missing-capability error. Unrequired newer
 capabilities are ignored.
@@ -211,7 +211,15 @@ seconds. Waiting agents receive periodic activity updates to avoid stale-agent
 retirement.
 
 `WatchFeed` provides a human's initial snapshot and refreshed snapshots after
-changes. It does not archive messages. Stream cancellation uses a separate
+changes. It does not archive messages. Each snapshot is the most recent
+`backlog` messages matching the request's filters (group, sender name, sending
+human with their agents, time range, and the caller's own scope), evaluated in
+SQL on every refresh. An older server would ignore the filter fields, so the
+client requires `feed-filter.v1` whenever one is set. The caller's scope uses
+delivery rows, so group mail counts by membership at send time. Snapshots
+re-send the whole window; `bbs view --json` emits only ids above the highest it
+has printed, and fails if a refresh brings a full window of new messages, since
+older ones may have been pushed out unseen. Stream cancellation uses a separate
 terminal channel so shutdown or failed credential checks bypass queued
 application data and do not retain a producer behind a full message buffer.
 Already delivered or transport-buffered data cannot be recalled.

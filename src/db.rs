@@ -807,9 +807,50 @@ pub fn session_agent(
 
 // ---- feed (bbs view) -------------------------------------------------------
 
-/// The most recent `limit` messages across the whole board, oldest first. Each
+/// Feed filters; each set field narrows the window. Names are resolved by the
+/// caller, so unknown names fail before this runs.
+#[derive(Debug, Default)]
+pub struct FeedFilter<'a> {
+    /// Broadcasts to any group, active or archived, with this name.
+    pub group: Option<&'a str>,
+    /// Sent by any human or agent, live or retired, with this name.
+    pub from: Option<&'a str>,
+    /// Sent by this human id or by an agent it owns.
+    pub from_human: Option<i64>,
+    /// `created_at >= since`.
+    pub since: Option<&'a str>,
+    /// `created_at < until`.
+    pub until: Option<&'a str>,
+    /// This human id's scope: sent by it or its agents, delivered to one of its
+    /// agents (so group mail counts by membership at send time), or a direct
+    /// message to the human itself.
+    pub scope: Option<i64>,
+}
+
+/// Whether any group, active or archived, ever had this name.
+pub fn group_name_exists(conn: &Connection, name: &str) -> Result<bool> {
+    Ok(conn
+        .prepare("SELECT 1 FROM bbs_groups WHERE name = ?1")?
+        .exists(params![name])?)
+}
+
+/// Whether any human or agent, live or retired, has this name.
+pub fn sender_name_exists(conn: &Connection, name: &str) -> Result<bool> {
+    Ok(conn
+        .prepare(
+            "SELECT 1 FROM humans WHERE lower(name) = lower(?1)
+             UNION ALL SELECT 1 FROM agents WHERE lower(name) = lower(?1)",
+        )?
+        .exists(params![name])?)
+}
+
+/// The most recent `limit` messages matching `filter`, oldest first. Each
 /// broadcast appears once, regardless of how many deliveries it fanned out to.
-pub fn recent_messages(conn: &Connection, limit: u32) -> Result<Vec<MessageView>> {
+pub fn recent_messages(
+    conn: &Connection,
+    limit: u32,
+    filter: &FeedFilter,
+) -> Result<Vec<MessageView>> {
     let mut stmt = conn.prepare(
         "SELECT m.id, m.created_at, m.from_kind, COALESCE(fa.name, fh.name), g.name,
                 COALESCE(ta.name, th.name), d.archived_at, m.body, owner.name
@@ -822,11 +863,31 @@ pub fn recent_messages(conn: &Connection, limit: u32) -> Result<Vec<MessageView>
          LEFT JOIN deliveries d ON m.to_group_id IS NULL AND d.message_id = m.id
          LEFT JOIN agents ta ON d.recipient_kind = 'agent' AND ta.id = d.recipient_id
          LEFT JOIN humans th ON d.recipient_kind = 'human' AND th.id = d.recipient_id
+         WHERE (?2 IS NULL OR g.name = ?2)
+           AND (?3 IS NULL OR lower(COALESCE(fa.name, fh.name)) = lower(?3))
+           AND (?4 IS NULL OR fh.id = ?4 OR sender.human_id = ?4)
+           AND (?5 IS NULL OR m.created_at >= ?5)
+           AND (?6 IS NULL OR m.created_at < ?6)
+           AND (?7 IS NULL OR fh.id = ?7 OR sender.human_id = ?7
+                OR (d.recipient_kind = 'human' AND d.recipient_id = ?7)
+                OR EXISTS (SELECT 1 FROM deliveries x
+                           JOIN agent_owners o ON o.agent_id = x.recipient_id
+                           WHERE x.message_id = m.id AND x.recipient_kind = 'agent'
+                             AND o.human_id = ?7))
          ORDER BY m.id DESC
          LIMIT ?1",
     )?;
+    let params = params![
+        limit,
+        filter.group,
+        filter.from,
+        filter.from_human,
+        filter.since,
+        filter.until,
+        filter.scope,
+    ];
     let mut rows: Vec<MessageView> = stmt
-        .query_map(params![limit], |r| {
+        .query_map(params, |r| {
             let from_kind: String = r.get(2)?;
             Ok(MessageView {
                 id: r.get(0)?,
@@ -901,7 +962,7 @@ mod tests {
         assert!(agent_groups(&conn).unwrap().is_empty());
         assert!(list_groups(&conn, None).unwrap().is_empty());
         assert!(list_groups(&conn, Some(1)).unwrap().is_empty());
-        let feed = recent_messages(&conn, 10).unwrap();
+        let feed = recent_messages(&conn, 10, &FeedFilter::default()).unwrap();
         assert_eq!(feed.len(), 1);
         assert_eq!(feed[0].to_group.as_deref(), Some("acme"));
         assert_eq!(feed[0].body, "old message");
@@ -1072,7 +1133,7 @@ mod tests {
         let m = insert_message(&conn, &will, None, "hi Bram", t).unwrap();
         insert_delivery(&conn, m, Kind::Agent, b.id).unwrap();
 
-        let feed = recent_messages(&conn, 10).unwrap();
+        let feed = recent_messages(&conn, 10, &FeedFilter::default()).unwrap();
         assert_eq!(feed.len(), 2);
         assert_eq!(
             (feed[0].to_group.as_deref(), feed[0].to_name.as_deref()),
@@ -1084,7 +1145,7 @@ mod tests {
         assert_eq!(feed[1].read_at, None);
 
         take_unread(&conn, &b, None, None, "2026-10-09T01:00:00.000000Z").unwrap();
-        let feed = recent_messages(&conn, 10).unwrap();
+        let feed = recent_messages(&conn, 10, &FeedFilter::default()).unwrap();
         assert_eq!(feed[0].read_at, None, "broadcast read times stay hidden");
         assert_eq!(
             feed[1].read_at.as_deref(),

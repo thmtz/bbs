@@ -685,7 +685,8 @@ impl Bbs for Server {
             let mut changes = state.notify.subscribe();
             // The first snapshot also checks the caller is a human, before the stream opens.
             let c = caller.clone();
-            let first = match state.call(move |conn| service::feed(conn, &c, req)).await {
+            let r = req.clone();
+            let first = match state.call(move |conn| service::feed(conn, &c, r)).await {
                 Ok(first) => first,
                 Err(status) => {
                     state.record_auth_failure(peer, &status);
@@ -711,8 +712,8 @@ impl Bbs for Server {
                             _ = tx.closed() => return,
                         }
                         changes.borrow_and_update();
-                        let c = caller.clone();
-                        snapshot = state.call(move |conn| service::feed(conn, &c, req)).await;
+                        let (c, r) = (caller.clone(), req.clone());
+                        snapshot = state.call(move |conn| service::feed(conn, &c, r)).await;
                     }
                 };
                 tokio::select! {
@@ -820,7 +821,10 @@ mod tests {
                 .watch_feed(Request::from_parts(
                     metadata,
                     extensions,
-                    proto::FeedRequest { backlog: 10 }
+                    proto::FeedRequest {
+                        backlog: 10,
+                        ..Default::default()
+                    }
                 ))
                 .await
                 .is_err()

@@ -23,6 +23,10 @@ const WAIT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const FEED_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const WAIT_TOUCH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const GROUP_DESCRIPTION: &str = "group-description.v1";
+/// Largest `bbs view --limit`; with 64 KiB bodies, a full window stays below
+/// FEED_DECODE_LIMIT (tonic's 4 MiB default would reject a large window).
+pub const MAX_FEED_WINDOW: u32 = 1000;
+const FEED_DECODE_LIMIT: usize = 80 * 1024 * 1024;
 
 pub enum Backend {
     Local(Local),
@@ -66,7 +70,8 @@ impl Remote {
             .await
             .with_context(|| format!("connecting to bbs server at {addr}"))?;
         Ok(Remote {
-            client: BbsClient::new(channel),
+            // A feed snapshot of MAX_FEED_WINDOW maximal bodies must still decode.
+            client: BbsClient::new(channel).max_decoding_message_size(FEED_DECODE_LIMIT),
             caller,
         })
     }
@@ -349,10 +354,10 @@ impl Backend {
         }
     }
 
-    /// Watch the most recent `backlog` messages (humans only): the first
-    /// snapshot comes at once, then one after every change.
-    pub async fn watch_feed(&mut self, backlog: u32) -> Result<FeedWatch<'_>> {
-        let req = proto::FeedRequest { backlog };
+    /// Watch the most recent `req.backlog` matching messages (humans only): the
+    /// first snapshot comes at once, then one after every change. Any filter
+    /// requires `feed-filter.v1`, since an older server would ignore it.
+    pub async fn watch_feed(&mut self, req: proto::FeedRequest) -> Result<FeedWatch<'_>> {
         Ok(match self {
             Backend::Local(local) => FeedWatch::Local {
                 local,
@@ -361,7 +366,12 @@ impl Backend {
                 next_poll: tokio::time::Instant::now(),
             },
             Backend::Remote(r) => {
-                FeedWatch::Remote(rpc!(r, watch_feed, req, &["owner-attribution.v1"])?)
+                let capabilities: &[&str] = if feed_filtered(&req) {
+                    &["owner-attribution.v1", "feed-filter.v1"]
+                } else {
+                    &["owner-attribution.v1"]
+                };
+                FeedWatch::Remote(rpc!(r, watch_feed, req, capabilities)?)
             }
         })
     }
@@ -386,6 +396,16 @@ impl Backend {
             }
         }
     }
+}
+
+/// Whether the request sets any field a server without `feed-filter.v1` ignores.
+fn feed_filtered(req: &proto::FeedRequest) -> bool {
+    req.group.is_some()
+        || req.from.is_some()
+        || req.from_human.is_some()
+        || req.since.is_some()
+        || req.until.is_some()
+        || req.mine
 }
 
 pub enum FeedWatch<'a> {
@@ -416,7 +436,7 @@ impl FeedWatch<'_> {
                 *next_poll = tokio::time::Instant::now() + FEED_POLL_INTERVAL;
                 let version = db::data_version(&local.conn)?;
                 if *seen != Some(version) {
-                    let snapshot = service::feed(&mut local.conn, &local.caller, *req)?;
+                    let snapshot = service::feed(&mut local.conn, &local.caller, req.clone())?;
                     *seen = Some(version);
                     return Ok(snapshot.messages);
                 }
@@ -618,7 +638,17 @@ mod tests {
         );
         assert!(backend.read(proto::ReadRequest::default()).await.is_err());
         assert!(backend.wait_for_mail(None).await.is_err());
-        assert!(backend.watch_feed(10).await.is_err());
+        let unfiltered = proto::FeedRequest {
+            backlog: 10,
+            ..Default::default()
+        };
+        assert!(backend.watch_feed(unfiltered).await.is_err());
+        let filtered = proto::FeedRequest {
+            backlog: 10,
+            mine: true,
+            ..Default::default()
+        };
+        assert!(backend.watch_feed(filtered).await.is_err());
         assert!(
             backend
                 .bind_session(proto::BindSessionRequest::default())
@@ -666,6 +696,7 @@ mod tests {
             ("Read", Some("owner-attribution.v1")),
             ("WaitForMail", Some("owner-attribution.v1")),
             ("WatchFeed", Some("owner-attribution.v1")),
+            ("WatchFeed", Some("owner-attribution.v1,feed-filter.v1")),
             ("BindSession", Some("human-token-sessions.v1")),
             ("SessionAgent", Some("human-token-sessions.v1")),
             ("GroupDelete", Some("group-archive.v1")),

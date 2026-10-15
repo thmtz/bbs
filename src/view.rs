@@ -1,31 +1,190 @@
-//! `bbs view`: a read-only, auto-following feed of every message on the board.
-//! It never archives anything, so watching does not consume anyone's mail.
+//! `bbs view`: a read-only feed of messages on the board, as an auto-following
+//! TUI, plain text, or JSONL. It never archives anything, so watching does not
+//! consume anyone's mail.
 
+use std::io::{IsTerminal, Write};
 use std::time::Duration;
 
-use anyhow::Result;
-use chrono::{DateTime, Local};
+use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Local, Utc};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
+use serde::Serialize;
 
+use crate::app::{display_time, parse_time};
 use crate::backend::{Backend, FeedWatch};
-use crate::proto::{Kind, Message};
+use crate::cli::ViewArgs;
+use crate::proto::{FeedRequest, Kind, Message};
 
 const BACKLOG: u32 = 200;
 const KEY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-pub async fn run(backend: &mut Backend) -> Result<()> {
-    let mut feed = backend.watch_feed(BACKLOG).await?;
+pub async fn run(backend: &mut Backend, args: ViewArgs) -> Result<()> {
+    let tui = !args.json && !args.no_follow;
+    if tui && !(std::io::stdout().is_terminal() && std::io::stdin().is_terminal()) {
+        bail!("bbs view needs a terminal; use --json or --no-follow for plain output");
+    }
+    let req = request(&args, Utc::now())?;
+    let window = req.backlog;
+    let mut feed = backend.watch_feed(req).await?;
     // Fetch before taking over the terminal, so a refusal prints normally.
     let rows = feed.next().await?;
+    if args.json {
+        return stream_json(&mut feed, rows, window, !args.no_follow).await;
+    }
+    if args.no_follow {
+        write_out(&format_feed(&rows))?;
+        return Ok(());
+    }
     let mut terminal = ratatui::init();
     let result = feed_loop(&mut terminal, &mut feed, rows).await;
     ratatui::restore();
     result
+}
+
+/// Translate flags into the server-side request. `--from @human` selects the
+/// human and every agent they own; a bare name selects that one sender.
+fn request(args: &ViewArgs, now: DateTime<Utc>) -> Result<FeedRequest> {
+    let (from, from_human) = match args.from.as_deref() {
+        Some(from) => match from.strip_prefix('@') {
+            Some(human) => (None, Some(human.to_string())),
+            None => (Some(from.to_string()), None),
+        },
+        None => (None, None),
+    };
+    let time = |flag, value: &Option<String>| {
+        value
+            .as_deref()
+            .map(|v| parse_time(flag, v, now))
+            .transpose()
+    };
+    Ok(FeedRequest {
+        backlog: args.limit.unwrap_or(BACKLOG),
+        group: args.group.clone(),
+        from,
+        from_human,
+        since: time("--since", &args.since)?,
+        until: time("--until", &args.until)?,
+        mine: args.mine,
+    })
+}
+
+/// Write to stdout; `false` once the reader has gone away (e.g. `| head`).
+fn write_out(text: &str) -> Result<bool> {
+    let mut out = std::io::stdout().lock();
+    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(false),
+        Err(e) => Err(e).context("writing to stdout"),
+    }
+}
+
+/// Emit each message once as JSONL. Every snapshot re-sends the whole window,
+/// so only ids above the highest already emitted are new. A full window made
+/// entirely of new messages may have pushed others out unseen; fail rather
+/// than silently skip them.
+async fn stream_json(
+    feed: &mut FeedWatch<'_>,
+    mut rows: Vec<Message>,
+    window: u32,
+    follow: bool,
+) -> Result<()> {
+    let mut last = None::<i64>;
+    loop {
+        if let (Some(last), Some(first)) = (last, rows.first())
+            && first.id > last
+            && rows.len() >= window as usize
+        {
+            bail!(
+                "more than {window} matching messages arrived between feed updates, so some may be missing; rerun with a larger --limit or narrow the filters"
+            );
+        }
+        let mut out = String::new();
+        for m in rows.iter().filter(|m| last.is_none_or(|l| m.id > l)) {
+            out.push_str(&serde_json::to_string(&json(m))?);
+            out.push('\n');
+        }
+        if !write_out(&out)? || !follow {
+            return Ok(());
+        }
+        let newest = rows.iter().map(|m| m.id).max().unwrap_or(0);
+        last = Some(last.map_or(newest, |l| l.max(newest)));
+        rows = feed.next().await?;
+    }
+}
+
+/// One JSONL message: the same shape as `bbs read --json`, plus `read_at`.
+/// Every field is present, null when it does not apply; names are bare and
+/// timestamps are the stored RFC3339 values.
+#[derive(Serialize)]
+struct MessageJson<'a> {
+    id: i64,
+    created_at: &'a str,
+    from: &'a str,
+    from_kind: &'static str,
+    /// The sending agent's human; null for humans and unknown owners.
+    from_owner: Option<&'a str>,
+    /// Direct recipient; null for broadcasts.
+    to: Option<&'a str>,
+    /// Broadcast group; null for direct messages.
+    group: Option<&'a str>,
+    body: &'a str,
+    /// When a direct message was read; null for broadcasts and unread mail.
+    read_at: Option<&'a str>,
+}
+
+fn json(m: &Message) -> MessageJson<'_> {
+    MessageJson {
+        id: m.id,
+        created_at: &m.created_at,
+        from: &m.from_name,
+        from_kind: match m.from_kind() {
+            Kind::Agent => "agent",
+            Kind::Human => "human",
+            Kind::Unspecified => "unspecified",
+        },
+        from_owner: m.from_owner.as_deref(),
+        to: m.to_name.as_deref(),
+        group: m.to_group.as_deref(),
+        body: &m.body,
+        read_at: m.read_at.as_deref(),
+    }
+}
+
+/// Plain text like `bbs read`, plus the sending agent's owner and read state.
+fn format_feed(rows: &[Message]) -> String {
+    let mut out = String::new();
+    for (i, m) in rows.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let from = match (m.from_kind(), &m.from_owner) {
+            (Kind::Human, _) => format!("{} (human)", m.from_name),
+            (_, Some(owner)) => format!("{}@{owner}", m.from_name),
+            (_, None) => m.from_name.clone(),
+        };
+        let to = match (&m.to_group, &m.to_name) {
+            (Some(group), _) => format!("@{group}"),
+            (None, to) => {
+                let state = match &m.read_at {
+                    Some(read) => format!("read {}", display_time(read)),
+                    None => "unread".into(),
+                };
+                format!("{} ({state})", to.as_deref().unwrap_or("?"))
+            }
+        };
+        out.push_str(&format!(
+            "[{}] from {from} to {to}:\n",
+            display_time(&m.created_at)
+        ));
+        out.push_str(m.body.trim_end_matches('\n'));
+        out.push('\n');
+    }
+    out
 }
 
 async fn feed_loop(
