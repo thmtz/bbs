@@ -1361,6 +1361,10 @@ fn groups_carry_human_written_descriptions(mode: Mode) {
     assert!(bbs.ok(&["group", "list"]).contains(&format!("  {max}\n")));
     bbs.ok(&["group", "describe", "plain", "-1 means off"]);
     assert!(bbs.ok(&["group", "list"]).contains("  -1 means off\n"));
+    assert!(
+        bbs.ok(&["group", "list", "--json"])
+            .contains(r#""name":"plain","members":[],"description":"-1 means off"}"#)
+    );
     bbs.ok(&["group", "describe", "plain", &max]);
     assert!(
         bbs.err(&["group", "describe", "missing", "x"])
