@@ -2,9 +2,10 @@
 
 Status: design proposal. Commands, configuration, and wire fields below are
 proposed unless explicitly described as current. No updater is enabled by this
-document. The chosen user policy is **notify by default; install in the background
-only after explicit opt-in**. Implementation and release publication are separate
-steps; running servers and listeners must not be restarted by an updater.
+document. The chosen user policy is **always enable update notices; install in the
+background only after explicit opt-in**. There is no disabled-notification mode.
+Implementation and release publication are separate steps; running servers and
+listeners must not be restarted by an updater.
 
 ## Current implementation
 
@@ -186,7 +187,6 @@ bbs update install --version 0.2.1 --root ~/.cargo
 bbs update configure --mode notify
 bbs update adopt                  # explicit setup of a managed client installation
 bbs update configure --mode auto  # explicit consent, requires managed installation
-bbs update configure --mode off
 bbs update retry                  # retry recorded work under the current policy
 bbs update rollback               # managed installs only; compatibility checked
 bbs version --json
@@ -195,18 +195,23 @@ bbs version --json
 Example settings, written by `configure` rather than a server:
 
 ```toml
-mode = "notify"       # off | notify | auto
+mode = "notify"       # notify | auto
 channel = "stable"
 check_interval_hours = 24
 repository = "https://github.com/wbbradley/bbs"
 ```
 
-`notify` checks periodically but never replaces executables. Print a brief notice
-only on an interactive human command's stderr, at most once per release per day.
+Both modes check periodically and inform the human; `notify` never replaces
+executables. Print a brief notice only on an interactive human command's stderr,
+at most once per release per day.
 Never pollute message stdout, a TUI, or hook JSON. Agent commands and hooks may
 record hints and schedule permitted work silently; status remains inspectable.
-`off` disables incidental checks/work, while explicit `update check` still works.
-A foreground install is an explicit action even when incidental updates are off.
+There is no `off` mode: reject it in both the command and settings file with an
+explanation of the supported modes. Switching from `auto` to `notify` disables
+background installation while retaining discovery and notices. In `auto` mode,
+also report a completed update or an update requiring manual action through the
+same human-facing notice path. Explicit `update check` and foreground installation
+remain available in either mode.
 
 Automatic eligibility requires a known, writable, supported installation, a
 compatible release within the allowed version line, and no unresolved local
@@ -237,8 +242,8 @@ Detach only a validated updater executable with a stable working directory,
 closed stdin, and output directed to its private log. Do not inherit hook pipes,
 TTYs, caller-token arguments, or server credentials. Normal commands never await
 release discovery or Cargo compilation; explicit check/install commands may wait.
-Bound worker/build time and capture failures for `update status`. Turning auto
-mode off prevents promotion even if an earlier build is still finishing.
+Bound worker/build time and capture failures for `update status`. Switching from
+`auto` to `notify` prevents promotion even if an earlier build is still finishing.
 
 Cargo installation must pin both source and dependencies:
 
@@ -333,7 +338,14 @@ clients on manual updates.
 
 Do not automatically restart running processes. A new invocation uses the new
 executable; an existing server or listener stays on its loaded binary. A client
-updater must never run database migrations as a validation probe. Validate build
+update does not wait for those processes to finish, and they may remain on the
+old version indefinitely. Never send a signal to request re-execution, or add an
+automatic self-reexec path. A human or the process supervisor performs any
+deliberate stop/start; server upgrades remain separately coordinated deployments.
+When reporting activation, distinguish the version selected for future commands
+from the version of the reporting process; do not claim existing processes were
+upgraded. A client updater must never run database migrations as a validation
+probe. Validate build
 identity through the side-effect-free version command and verify compatibility
 before promotion.
 
@@ -382,7 +394,9 @@ for version discovery and notifications.
 | Offline catalog or malformed/untrusted hint | Existing CLI behavior unaffected; bounded retry and inspectable status |
 | Many simultaneous hook invocations | One check/worker per install; no compiler output or pipe inheritance |
 | Worker crash, surviving compiler, clock jump, duplicate retry | Reservation remains held until compiler ends; durable backoff; no build storm |
-| Auto disabled during build | Candidate is not promoted |
+| Switch from auto to notify during build | Candidate is not promoted; discovery/notices remain enabled |
+| Request off mode in CLI or settings | Reject unsupported mode; notification policy cannot be disabled |
+| Activation while an old client/listener remains running | New invocations use selected release; old process continues without signals or re-execution |
 | PATH shadow, symlink, custom root, nonwritable install | Correct target reported; refuse ambiguous automatic replacement |
 | Manual Cargo failure or disk full | Record command/root/revision; report manual recovery without claiming atomic rollback |
 | Managed build/promotion failure or crash around pointer/state writes | Current pointer selects a complete root; recover bookkeeping without metadata surgery |
