@@ -427,6 +427,29 @@ pub fn group_register(
     })
 }
 
+pub fn group_delete(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::GroupRequest,
+) -> Result<proto::GroupResponse> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.human()?;
+        let group = group_name(&req.group);
+        let gid = require_group(ctx.conn, group)?;
+        // Notify current members before archiving removes the group's access scope.
+        broadcast(
+            ctx,
+            &me,
+            gid,
+            &format!("Human {:?} archived group @{group}.", me.name),
+        )?;
+        db::archive_group(ctx.conn, gid, &ctx.now_s)?;
+        Ok(proto::GroupResponse {
+            group: group.to_string(),
+        })
+    })
+}
+
 pub fn group_join(
     conn: &mut Connection,
     caller: &Caller,

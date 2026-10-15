@@ -27,6 +27,7 @@ service Bbs {
   rpc Retire(RetireRequest) returns (ByeResponse);
 
   rpc GroupRegister(GroupRequest) returns (GroupResponse);
+  rpc GroupDelete(GroupRequest) returns (GroupResponse);
   rpc GroupJoin(GroupRequest) returns (GroupJoinResponse);
   rpc GroupLeave(GroupRequest) returns (GroupResponse);
   rpc GroupRemove(GroupRemoveRequest) returns (GroupRemoveResponse);

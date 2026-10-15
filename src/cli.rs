@@ -162,6 +162,8 @@ pub enum AdminHumanCommand {
 pub enum GroupCommand {
     /// Create a group (humans only).
     Register { group: String },
+    /// Archive a group and end its access scope (humans only).
+    Delete { group: String },
     /// Join a group (agents only).
     Join { group: String },
     /// Leave a group (agents only).
