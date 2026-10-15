@@ -98,6 +98,8 @@ def read_bbs(bbs="bbs"):
     """Use the public CLI, respecting its server and caller configuration."""
     groups = {}
     for line in command([bbs, "group", "list"]).splitlines():
+        if line.startswith("  ") and groups:
+            continue  # the preceding group's description
         if not line.startswith("@") or ": " not in line:
             raise ValueError(f"unrecognized bbs group list row: {line!r}")
         name, members = line[1:].split(": ", 1)

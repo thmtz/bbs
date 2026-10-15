@@ -222,7 +222,7 @@ fn version_reports_identity_without_side_effects() {
             );
             assert_eq!(report["protocol"]["epoch"], 2);
             assert!(report["protocol"]["capabilities"].as_array().unwrap().len() >= 4);
-            assert_eq!(report["schema_version"], 6);
+            assert_eq!(report["schema_version"], 7);
             assert_eq!(report["config_format"], 1);
             assert!(!report["target"].as_str().unwrap().is_empty());
         } else {
@@ -1264,6 +1264,139 @@ fn group_archive_rolls_back_notice_on_failure(mode: Mode) {
     assert_eq!(bbs.ok(&["group", "list"]), "");
 }
 
+fn groups_carry_human_written_descriptions(mode: Mode) {
+    let bbs = Bbs::with_mode("group-description", mode);
+    assert_eq!(
+        bbs.ok(&[
+            "group",
+            "register",
+            "infra",
+            "--description",
+            "  GPU fleet and deploys  "
+        ]),
+        "Registered group @infra.\n"
+    );
+    bbs.ok(&["group", "register", "plain"]);
+    let (a, ta) = bbs.register();
+    bbs.ok(&["--token", &ta, "group", "join", "infra"]);
+    bbs.ok(&["read"]);
+    bbs.ok(&["--token", &ta, "read"]);
+
+    // Stored trimmed, shown indented under its group; groups without one are unchanged.
+    let listing = format!("@infra: {a}\n  GPU fleet and deploys\n@plain: (no agents)\n");
+    assert_eq!(bbs.ok(&["group", "list"]), listing);
+    assert_eq!(
+        bbs.ok(&["--token", &ta, "group", "list"]),
+        format!("@infra: {a}\n  GPU fleet and deploys\n")
+    );
+
+    // Agents read descriptions but cannot write them.
+    assert!(
+        bbs.err(&["--token", &ta, "group", "describe", "infra", "mine now"])
+            .contains("humans only")
+    );
+    assert!(
+        bbs.err(&["--token", &ta, "group", "describe", "infra", "--clear"])
+            .contains("humans only")
+    );
+    assert!(
+        bbs.err(&[
+            "--token",
+            &ta,
+            "group",
+            "register",
+            "x",
+            "--description",
+            "d"
+        ])
+        .contains("humans only")
+    );
+
+    assert_eq!(
+        bbs.ok(&["group", "describe", "@plain", "Scratch space"]),
+        "Updated the description of @plain.\n"
+    );
+    bbs.ok(&["group", "describe", "infra", "Fleet, deploys: and on-call"]);
+    assert_eq!(
+        bbs.ok(&["group", "list"]),
+        format!(
+            "@infra: {a}\n  Fleet, deploys: and on-call\n@plain: (no agents)\n  Scratch space\n"
+        )
+    );
+    assert_eq!(
+        bbs.ok(&["group", "describe", "plain", "--clear"]),
+        "Cleared the description of @plain.\n"
+    );
+    assert!(
+        bbs.ok(&["group", "list"])
+            .ends_with("@plain: (no agents)\n")
+    );
+    // Describing is quiet metadata, not a lifecycle notice.
+    assert_eq!(bbs.ok(&["--token", &ta, "read"]), "");
+
+    // Validation happens in the service and never half-applies.
+    let max = "d".repeat(200);
+    bbs.ok(&["group", "describe", "plain", &max]);
+    for (bad, why) in [
+        ("d".repeat(201), "the limit is 200"),
+        ("   ".to_string(), "empty"),
+        ("two\nlines".to_string(), "one line"),
+        ("tab\there".to_string(), "one line"),
+        ("line\u{2028}separator".to_string(), "one line"),
+        ("evil\u{202E}txt.exe".to_string(), "invisible formatting"),
+        ("zero\u{200B}width".to_string(), "invisible formatting"),
+        ("tag\u{E0041}char".to_string(), "invisible formatting"),
+    ] {
+        assert!(
+            bbs.err(&["group", "describe", "plain", &bad]).contains(why),
+            "{bad:?}"
+        );
+        assert!(
+            bbs.err(&["group", "register", "fresh", "--description", &bad])
+                .contains(why),
+            "{bad:?}"
+        );
+    }
+    assert!(!bbs.ok(&["group", "list"]).contains("@fresh"));
+    assert!(bbs.ok(&["group", "list"]).contains(&format!("  {max}\n")));
+    bbs.ok(&["group", "describe", "plain", "-1 means off"]);
+    assert!(bbs.ok(&["group", "list"]).contains("  -1 means off\n"));
+    assert!(
+        bbs.ok(&["group", "list", "--json"])
+            .contains(r#""name":"plain","members":[],"description":"-1 means off"}"#)
+    );
+    bbs.ok(&["group", "describe", "plain", &max]);
+    assert!(
+        bbs.err(&["group", "describe", "missing", "x"])
+            .contains("no such group")
+    );
+    assert!(
+        bbs.err(&["group", "describe", "infra"])
+            .contains("required arguments")
+    );
+    assert!(
+        bbs.err(&["group", "describe", "infra", "x", "--clear"])
+            .contains("cannot be used with")
+    );
+
+    // Reusing an archived name starts without the old description.
+    bbs.ok(&["group", "delete", "infra"]);
+    bbs.ok(&["group", "register", "infra"]);
+    assert!(
+        bbs.ok(&["group", "list"])
+            .starts_with("@infra: (no agents)\n@plain")
+    );
+    let stored: Vec<Option<String>> = bbs
+        .db()
+        .prepare("SELECT description FROM bbs_groups WHERE name = 'infra' ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(stored, [Some("Fleet, deploys: and on-call".into()), None]);
+}
+
 fn joining_notifies_the_group(mode: Mode) {
     let bbs = Bbs::with_mode("join", mode);
     bbs.ok(&["group", "register", "g"]);
@@ -1673,8 +1806,8 @@ fn json_output_is_one_object_per_line(mode: Mode) {
     assert_eq!(
         groups,
         vec![
-            serde_json::json!({"name": "acme", "members": [b]}),
-            serde_json::json!({"name": "empty", "members": []}),
+            serde_json::json!({"name": "acme", "members": [b], "description": null}),
+            serde_json::json!({"name": "empty", "members": [], "description": null}),
         ]
     );
 }
@@ -1851,6 +1984,7 @@ both_modes!(
     humans_remove_agents_from_groups,
     deleting_groups_archives_history_and_removes_access,
     group_archive_rolls_back_notice_on_failure,
+    groups_carry_human_written_descriptions,
     joining_notifies_the_group,
     leaving_or_removal_notifies_the_group,
     agents_lists_status_and_scopes_visibility,

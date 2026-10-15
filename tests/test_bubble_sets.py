@@ -98,7 +98,7 @@ class BubbleSetsTests(unittest.TestCase):
 
     def test_bbs_input_ignores_humans_and_retired_includes_ungrouped(self):
         with patch.object(bs, "command", side_effect=[
-            "@team: Alice, Bob\n@empty: (no agents)\n",
+            "@team: Alice, Bob\n  Ships the: thing, with Carol\n@empty: (no agents)\n",
             ("NAME KIND GROUPS ACTIVE_AT WHERE STATUS\nWill human * now\nAlice agent team now\n"
             "Bob agent team now\nSolo agent - now\nOld retired - now\n"),
         ]) as run:
@@ -106,9 +106,10 @@ class BubbleSetsTests(unittest.TestCase):
         self.assertEqual(data["agents"], ["Alice", "Bob", "Solo"])
         self.assertEqual(data["groups"], {"empty": [], "team": ["Alice", "Bob"]})
         self.assertEqual(run.call_args_list[0].args[0], ["custom-bbs", "group", "list"])
-        with (patch.object(bs, "command", return_value="unexpected output"),
-              self.assertRaisesRegex(ValueError, "unrecognized")):
-            bs.read_bbs()
+        for output in ("unexpected output", "  description before any group\n"):
+            with (patch.object(bs, "command", return_value=output),
+                  self.assertRaisesRegex(ValueError, "unrecognized")):
+                bs.read_bbs()
 
     def test_rejects_invalid_input_and_impossible_fixed_positions(self):
         for data in ({}, {"groups": []}, {"groups": {"g": "Alice"}},

@@ -134,11 +134,25 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
             format!("Added human {name}.\n")
         }
         Command::Group { command } => match command {
-            GroupCommand::Register { group } => {
+            GroupCommand::Register { group, description } => {
                 let r = backend
-                    .group_register(proto::GroupRequest { group })
+                    .group_register(proto::GroupRegisterRequest { group, description })
                     .await?;
                 format!("Registered group @{}.\n", r.group)
+            }
+            GroupCommand::Describe {
+                group,
+                description,
+                clear,
+            } => {
+                // Clap requires exactly one of a description or --clear.
+                let req = proto::GroupDescribeRequest { group, description };
+                let r = backend.group_describe(req).await?;
+                if clear {
+                    format!("Cleared the description of @{}.\n", r.group)
+                } else {
+                    format!("Updated the description of @{}.\n", r.group)
+                }
             }
             GroupCommand::Delete { group } => {
                 let r = backend.group_delete(proto::GroupRequest { group }).await?;
@@ -315,6 +329,7 @@ fn json_lines<T: Serialize>(items: impl IntoIterator<Item = T>) -> Result<String
 struct GroupJson<'a> {
     name: &'a str,
     members: &'a [String],
+    description: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -359,6 +374,7 @@ fn format_groups(groups: &[proto::Group], json: bool) -> Result<String> {
         return json_lines(groups.iter().map(|g| GroupJson {
             name: &g.name,
             members: &g.members,
+            description: g.description.as_deref(),
         }));
     }
     let mut out = String::new();
@@ -369,6 +385,10 @@ fn format_groups(groups: &[proto::Group], json: bool) -> Result<String> {
             g.members.join(", ")
         };
         writeln!(out, "@{}: {members}", g.name)?;
+        // Indented under its group so member parsing stays one `@group: ...` row.
+        if let Some(description) = &g.description {
+            writeln!(out, "  {description}")?;
+        }
     }
     Ok(out)
 }

@@ -511,7 +511,7 @@ impl Bbs for Server {
 
     async fn group_register(
         &self,
-        req: Request<proto::GroupRequest>,
+        req: Request<proto::GroupRegisterRequest>,
     ) -> Result<Response<proto::GroupResponse>, Status> {
         self.unary(
             "group_register",
@@ -528,6 +528,19 @@ impl Bbs for Server {
     ) -> Result<Response<proto::GroupResponse>, Status> {
         self.unary("group_delete", req, Effect::Write, service::group_delete)
             .await
+    }
+
+    async fn group_describe(
+        &self,
+        req: Request<proto::GroupDescribeRequest>,
+    ) -> Result<Response<proto::GroupResponse>, Status> {
+        self.unary(
+            "group_describe",
+            req,
+            Effect::Write,
+            service::group_describe,
+        )
+        .await
     }
 
     async fn group_join(
