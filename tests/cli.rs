@@ -855,8 +855,12 @@ fn bye_notifies_and_leaves_groups(mode: Mode) {
     bbs.ok(&["read"]);
 
     bbs.ok(&["--token", &ta, "bye"]);
-    let from_g = format!("from {a} to @g:\n{a} retired and left @g.\n");
-    let from_h = format!("from {a} to @h:\n{a} retired and left @h.\n");
+    let from_g = format!(
+        "from {a} to @g:\nAgent {a:?} retired. Agent {a:?} is no longer a member of group @g.\n"
+    );
+    let from_h = format!(
+        "from {a} to @h:\nAgent {a:?} retired. Agent {a:?} is no longer a member of group @h.\n"
+    );
     let mail_b = bbs.ok(&["--token", &tb, "read"]);
     assert!(
         mail_b.contains(&from_g) && !mail_b.contains("@h"),
@@ -892,7 +896,9 @@ fn humans_retire_agents(mode: Mode) {
             .contains("humans only")
     );
     assert_eq!(bbs.ok(&["retire", &a]), format!("Retired {a}.\n"));
-    let notice = format!("from will (human) to @g:\nwill retired {a} and left @g.\n");
+    let notice = format!(
+        "from will (human) to @g:\nHuman \"will\" retired agent {a:?}. Agent {a:?} is no longer a member of group @g.\n"
+    );
     assert!(bbs.ok(&["--token", &tb, "read"]).contains(&notice));
     assert!(bbs.ok(&["--as", "ada", "read"]).contains(&notice));
     assert!(
@@ -1016,7 +1022,7 @@ fn joining_notifies_the_group(mode: Mode) {
     bbs.ok(&["--token", &ta, "group", "join", "g"]);
     bbs.ok(&["--token", &tb, "group", "join", "g"]);
 
-    let joined = format!("from {b} to @g:\n{b} joined @g.\n");
+    let joined = format!("from {b} to @g:\nAgent {b:?} joined group @g.\n");
     assert!(bbs.ok(&["--token", &ta, "read"]).contains(&joined));
     assert!(bbs.ok(&["read"]).contains(&joined));
     assert_eq!(bbs.ok(&["--token", &tb, "read"]), "");
@@ -1043,7 +1049,7 @@ fn leaving_or_removal_notifies_the_group(mode: Mode) {
     }
 
     bbs.ok(&["--token", &tc, "group", "leave", "acme"]);
-    let left = format!("from {c} to @acme:\n{c} left @acme.\n");
+    let left = format!("from {c} to @acme:\nAgent {c:?} left group @acme.\n");
     assert!(bbs.ok(&["--token", &ta, "read"]).contains(&left));
     assert!(bbs.ok(&["--token", &tb, "read"]).contains(&left));
     assert!(bbs.ok(&["read"]).contains(&left));
@@ -1051,7 +1057,9 @@ fn leaving_or_removal_notifies_the_group(mode: Mode) {
     assert_eq!(bbs.ok(&["--token", &td, "read"]), "");
 
     bbs.ok(&["group", "remove", "acme", &a]);
-    let removed = format!("from will (human) to @acme:\nwill removed {a} from @acme.\n");
+    let removed = format!(
+        "from will (human) to @acme:\nHuman \"will\" removed agent {a:?} from group @acme.\n"
+    );
     assert!(bbs.ok(&["--token", &ta, "read"]).contains(&removed));
     assert!(bbs.ok(&["--token", &tb, "read"]).contains(&removed));
     assert!(bbs.ok(&["--as", "ada", "read"]).contains(&removed));
