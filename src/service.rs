@@ -416,8 +416,8 @@ pub fn group_register(
         let me = ctx.human()?;
         let group = group_name(&req.group);
         validate_group_name(group)?;
-        if db::group_name_reserved(ctx.conn, group)? {
-            bail!("group @{group} already exists (archived names remain reserved)");
+        if db::group_id(ctx.conn, group)?.is_some() {
+            bail!("group @{group} already exists");
         }
         db::insert_group(ctx.conn, group, &ctx.now_s)?;
         tracing::info!(group, by = me.name, "registered group");

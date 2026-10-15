@@ -1080,11 +1080,6 @@ fn deleting_groups_archives_history_and_removes_access(mode: Mode) {
             .contains("no such group")
     );
 
-    assert!(
-        bbs.err(&["group", "register", "acme"])
-            .contains("archived names remain reserved")
-    );
-
     // Archived membership rows cannot authorize access, but history remains readable.
     let db = bbs.db();
     let (archived, members): (bool, i64) = db.query_row(
@@ -1111,6 +1106,46 @@ fn deleting_groups_archives_history_and_removes_access(mode: Mode) {
     let retirement = bbs.ok(&["read"]);
     assert!(retirement.contains("@other"));
     assert!(!retirement.contains("@acme"), "{retirement}");
+
+    // Reusing a name creates a new scope and never restores old membership.
+    bbs.ok(&["group", "register", "acme"]);
+    assert!(
+        bbs.err(&["group", "register", "acme"])
+            .contains("already exists")
+    );
+    assert!(!bbs.ok(&["--token", &tb, "group", "list"]).contains("acme"));
+    assert!(
+        bbs.err(&["--token", &tb, "send", "--to", "@acme", "denied"])
+            .contains("not a member")
+    );
+    let (c, tc) = bbs.register();
+    bbs.ok(&["--token", &tc, "group", "join", "acme"]);
+    bbs.ok(&["send", "--to", "@acme", "new broadcast"]);
+    assert!(bbs.ok(&["--token", &tc, "read"]).contains("new broadcast"));
+    assert!(!bbs.ok(&["--token", &tb, "read"]).contains("new broadcast"));
+    assert!(
+        !bbs.ok(&["--token", &tc, "read", "--archived"])
+            .contains("retained broadcast")
+    );
+    assert!(
+        bbs.err(&["--token", &tb, "send", "--to", &c, "denied"])
+            .contains("not in any of your groups")
+    );
+    assert!(
+        bbs.ok(&["--token", &tb, "read", "--archived"])
+            .contains("retained broadcast")
+    );
+    let (old_id, new_id): (i64, i64) = db
+        .query_row(
+            "SELECT min(id), max(id) FROM bbs_groups WHERE name = 'acme'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_ne!(old_id, new_id);
+    bbs.ok(&["group", "delete", "acme"]);
+    bbs.ok(&["group", "register", "acme"]);
+    assert!(bbs.ok(&["group", "list"]).contains("@acme: (no agents)\n"));
 }
 
 fn group_archive_rolls_back_notice_on_failure(mode: Mode) {

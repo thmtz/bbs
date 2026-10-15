@@ -147,19 +147,34 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
     if schema_version(conn)? == MIGRATIONS.len() {
         return Ok(());
     }
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let current = schema_version(&tx)?;
-    if current > MIGRATIONS.len() {
-        bail!("BBS schema v{current} is newer than this binary supports");
+    if !conn.is_autocommit() {
+        bail!("BBS migrations require a connection without an active transaction");
     }
-    for (i, sql) in MIGRATIONS.iter().enumerate().skip(current) {
-        tx.execute_batch(sql)
-            .with_context(|| format!("applying migration {}", i + 1))?;
-        tracing::info!(version = i + 1, "applied migration");
-    }
-    tx.pragma_update(None, "user_version", MIGRATIONS.len() as i64)?;
-    tx.commit()?;
-    Ok(())
+    // SQLite table rebuilds must disable foreign-key enforcement outside the
+    // transaction. Validate the resulting references before commit and restore
+    // the caller's setting even if a migration or commit fails.
+    let foreign_keys: bool = conn.pragma_query_value(None, "foreign_keys", |r| r.get(0))?;
+    conn.pragma_update(None, "foreign_keys", false)?;
+    let result = (|| -> Result<()> {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = schema_version(&tx)?;
+        if current > MIGRATIONS.len() {
+            bail!("BBS schema v{current} is newer than this binary supports");
+        }
+        for (i, sql) in MIGRATIONS.iter().enumerate().skip(current) {
+            tx.execute_batch(sql)
+                .with_context(|| format!("applying migration {}", i + 1))?;
+            tracing::info!(version = i + 1, "applied migration");
+        }
+        if tx.prepare("PRAGMA foreign_key_check")?.exists([])? {
+            bail!("BBS migration would leave invalid foreign-key references");
+        }
+        tx.pragma_update(None, "user_version", MIGRATIONS.len() as i64)?;
+        tx.commit()?;
+        Ok(())
+    })();
+    conn.pragma_update(None, "foreign_keys", foreign_keys)?;
+    result
 }
 
 // ---- humans ----------------------------------------------------------------
@@ -463,14 +478,6 @@ pub fn group_id(conn: &Connection, name: &str) -> Result<Option<i64>> {
             |r| r.get(0),
         )
         .optional()?)
-}
-
-pub fn group_name_reserved(conn: &Connection, name: &str) -> Result<bool> {
-    Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM bbs_groups WHERE name = ?1)",
-        params![name],
-        |r| r.get(0),
-    )?)
 }
 
 pub fn insert_group(conn: &Connection, name: &str, now: &str) -> Result<i64> {
@@ -842,7 +849,7 @@ mod tests {
         assert_eq!(member_groups(&conn, 1).unwrap(), vec![(1, "acme".into())]);
         archive_group(&conn, 1, "2026-10-15").unwrap();
         assert_eq!(group_id(&conn, "acme").unwrap(), None);
-        assert!(group_name_reserved(&conn, "acme").unwrap());
+
         assert!(!is_member(&conn, 1, 1).unwrap());
         assert!(!share_group(&conn, 1, 1).unwrap());
         assert!(group_member_ids(&conn, 1).unwrap().is_empty());
@@ -876,7 +883,51 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
+        assert!(index_sql.contains("CREATE UNIQUE INDEX"));
         assert!(index_sql.contains("WHERE archived_at IS NULL"));
+        let new_id = insert_group(&conn, "acme", "2026-10-15").unwrap();
+        assert_ne!(new_id, 1);
+        assert!(group_member_ids(&conn, new_id).unwrap().is_empty());
+        assert!(insert_group(&conn, "acme", "2026-10-15").is_err());
+        assert!(
+            conn.pragma_query_value(None, "foreign_keys", |r| r.get::<_, bool>(0))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn failed_migration_rolls_back_and_restores_foreign_keys() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..5] {
+            conn.execute_batch(sql).unwrap();
+        }
+        // An existing invalid reference must prevent publishing a rebuilt table.
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             PRAGMA user_version = 5;
+             INSERT INTO messages VALUES (1, 'human', 1, 99, 'orphan', '2026-10-14');
+             PRAGMA foreign_keys = ON;",
+        )
+        .unwrap();
+        assert!(
+            migrate(&mut conn)
+                .unwrap_err()
+                .to_string()
+                .contains("foreign-key")
+        );
+        assert_eq!(schema_version(&conn).unwrap(), 5);
+        assert!(
+            conn.pragma_query_value(None, "foreign_keys", |r| r.get::<_, bool>(0))
+                .unwrap()
+        );
+        assert!(conn.prepare("SELECT archived_at FROM bbs_groups").is_err());
+        assert!(
+            !conn
+                .prepare("SELECT name FROM sqlite_schema WHERE name = 'bbs_groups_replacement'")
+                .unwrap()
+                .exists([])
+                .unwrap()
+        );
     }
 
     #[test]
