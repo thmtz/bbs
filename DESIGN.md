@@ -222,9 +222,7 @@ ids first and only the filters present reach the SQL. An any-of filter (sender
 name, a human with their agents, the caller's scope) runs one indexed walk per
 principal or delivery recipient, each stopping after `backlog` rows, and merges
 them, so dense and sparse matches both avoid scanning the message table. The
-supporting indexes are reconciled by name whenever a board is opened instead of
-by a numbered migration: they carry no semantics, and older binaries open the
-board unchanged.
+supporting indexes come from migration 0008 (schema 8).
 
 Snapshots re-send the whole window, which suits the TUI. A request with
 `after_id` is a cursor instead: each snapshot is the next batch of at most

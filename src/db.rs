@@ -19,6 +19,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0005_human_tokens.sql"),
     include_str!("../migrations/0006_group_archive.sql"),
     include_str!("../migrations/0007_group_description.sql"),
+    include_str!("../migrations/0008_feed_indexes.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,13 +156,9 @@ fn schema_version(conn: &Connection) -> Result<usize> {
 /// Bring the schema up to date. Every command calls this on open; concurrent
 /// callers serialize on the write lock and re-check the version under it.
 pub fn migrate(conn: &mut Connection) -> Result<()> {
-    if schema_version(conn)? != MIGRATIONS.len() {
-        apply_migrations(conn)?;
+    if schema_version(conn)? == MIGRATIONS.len() {
+        return Ok(());
     }
-    ensure_indexes(conn)
-}
-
-fn apply_migrations(conn: &mut Connection) -> Result<()> {
     if !conn.is_autocommit() {
         bail!("BBS migrations require a connection without an active transaction");
     }
@@ -834,60 +831,6 @@ pub struct FeedFilter<'a> {
     pub after_id: Option<i64>,
 }
 
-/// Feed lookups. Pure performance: they carry no semantics, so they are
-/// reconciled by name on open (`ensure_indexes`) rather than versioned, and
-/// older binaries can open a board that has them. Changing a definition needs
-/// a new name.
-const FEED_INDEXES: &[(&str, &str)] = &[
-    (
-        "messages_group",
-        "CREATE INDEX IF NOT EXISTS messages_group ON messages (to_group_id, id)",
-    ),
-    (
-        "messages_sender",
-        "CREATE INDEX IF NOT EXISTS messages_sender ON messages (from_kind, from_id, id)",
-    ),
-    (
-        "messages_created",
-        "CREATE INDEX IF NOT EXISTS messages_created ON messages (created_at, id)",
-    ),
-    (
-        "messages_human_dm",
-        "CREATE INDEX IF NOT EXISTS messages_human_dm ON messages (id)
-         WHERE to_group_id IS NULL AND from_kind = 'human'",
-    ),
-    (
-        "deliveries_recipient",
-        "CREATE INDEX IF NOT EXISTS deliveries_recipient
-         ON deliveries (recipient_kind, recipient_id, message_id)",
-    ),
-];
-
-/// Create any missing feed index. Reads first, so an up-to-date board takes no
-/// write lock; concurrent openers serialize on the immediate transaction.
-fn ensure_indexes(conn: &mut Connection) -> Result<()> {
-    let present = |conn: &Connection, name: &str| -> Result<bool> {
-        Ok(conn
-            .prepare("SELECT 1 FROM sqlite_schema WHERE type = 'index' AND name = ?1")?
-            .exists(params![name])?)
-    };
-    let mut missing = false;
-    for (name, _) in FEED_INDEXES {
-        missing |= !present(conn, name)?;
-    }
-    if !missing {
-        return Ok(());
-    }
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    for (name, sql) in FEED_INDEXES {
-        tx.execute_batch(sql)
-            .with_context(|| format!("creating index {name}"))?;
-    }
-    tx.commit()?;
-    tracing::info!("created feed indexes");
-    Ok(())
-}
-
 /// Ids of every group, active or archived, with this name.
 pub fn group_ids_named(conn: &Connection, name: &str) -> Result<Vec<i64>> {
     Ok(conn
@@ -1300,7 +1243,7 @@ mod tests {
         .unwrap();
         migrate(&mut conn).unwrap();
         migrate(&mut conn).unwrap();
-        assert_eq!(schema_version(&conn).unwrap(), 7);
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
         let row = |description: Option<&str>| GroupRow {
             name: "acme".into(),
             description: description.map(Into::into),
@@ -1429,27 +1372,59 @@ mod tests {
             assert!(!plan.iter().any(|l| l == "SCAN m"), "{index}: {plan:?}");
             assert!(plan.iter().any(|l| l.contains(index)), "{index}: {plan:?}");
         }
-        // Reopening an up-to-date board leaves the indexes alone.
-        migrate(&mut conn).unwrap();
     }
 
     #[test]
-    fn feed_indexes_are_added_to_existing_boards() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        migrate(&mut conn).unwrap();
-        conn.execute_batch("DROP INDEX messages_group; DROP INDEX messages_sender;")
+    fn feed_indexes_migrate_existing_board_and_keep_history() {
+        let index_names = |conn: &Connection| -> Vec<String> {
+            conn.prepare(
+                "SELECT name FROM sqlite_schema WHERE type = 'index' AND name IN
+                 ('messages_group', 'messages_sender', 'messages_created',
+                  'messages_human_dm', 'deliveries_recipient') ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+        };
+        // A pre-merge build of this change may already have created the indexes.
+        for preexisting in [false, true] {
+            let mut conn = Connection::open_in_memory().unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            for sql in &MIGRATIONS[..7] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.execute_batch(
+                "PRAGMA user_version = 7;
+                 INSERT INTO humans (id, name, created_at, active_at)
+                     VALUES (1, 'will', '2026-10-14', '2026-10-14');
+                 INSERT INTO bbs_groups (id, name, created_at) VALUES (1, 'acme', '2026-10-14');
+                 INSERT INTO messages (id, from_kind, from_id, to_group_id, body, created_at)
+                     VALUES (1, 'human', 1, 1, 'before schema 8', '2026-10-14T00:00:00.000000Z');",
+            )
             .unwrap();
-        migrate(&mut conn).unwrap();
-        for (name, _) in FEED_INDEXES {
-            assert!(
-                conn.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'index' AND name = ?1")
-                    .unwrap()
-                    .exists([name])
-                    .unwrap(),
-                "{name}"
-            );
+            if preexisting {
+                conn.execute_batch(
+                    "CREATE INDEX messages_group ON messages (to_group_id, id);
+                     CREATE INDEX deliveries_recipient
+                         ON deliveries (recipient_kind, recipient_id, message_id);",
+                )
+                .unwrap();
+            }
+            assert!(index_names(&conn).len() < 5);
+            migrate(&mut conn).unwrap();
+            migrate(&mut conn).unwrap();
+            assert_eq!(schema_version(&conn).unwrap(), 8);
+            assert_eq!(index_names(&conn).len(), 5, "preexisting: {preexisting}");
+            let filter = FeedFilter {
+                group_ids: Some(vec![1]),
+                ..Default::default()
+            };
+            let feed = feed_messages(&conn, 10, &filter).unwrap();
+            assert_eq!(feed.len(), 1);
+            assert_eq!(feed[0].body, "before schema 8");
         }
-        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 
     #[test]

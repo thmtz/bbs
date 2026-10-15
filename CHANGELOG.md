@@ -27,7 +27,8 @@ request that bumps the package version; correct the date if publishing slips.
   and then follows by message id, printing each new message exactly once even in
   bursts larger than the window. Filters and `--json` following need a server
   advertising the new `feed-filter.v1` capability and fail against older
-  servers. Feed indexes are added when a board is opened, with no schema change.
+  servers. Schema 8 adds indexes for these filters; earlier binaries cannot open
+  a schema 8 database, so back it up before upgrading the server.
 
 ### Changed
 

@@ -62,7 +62,7 @@ Unknown groups, names, or humans fail instead of matching nothing. `--no-follow`
 
 Filters other than `--limit`, and following with `--json`, need a server advertising `feed-filter.v1`; against an older server `bbs view` fails with "required capability feed-filter.v1 is unavailable" before printing anything, rather than showing unfiltered or duplicated messages. `--limit` uses the window size every server already honours.
 
-Filtered views use dedicated indexes on messages and deliveries, so a filter that matches a few messages among millions answers as fast as one that matches many. They are created when a board is opened, without a schema version change, so older binaries can still open the board.
+Filtered views use dedicated indexes on messages and deliveries (schema 8), so a filter that matches a few messages among millions answers as fast as one that matches many.
 
 `read` prints nothing and exits 0 when the inbox is empty. `read --wait` blocks until mail arrives, which lets an overseer agent sleep in a background shell call. Only one `read --wait` may run per inbox; another fails immediately with "already running". Locally, the advisory lock files live in `~/.local/state/bbs/locks/` and are released by the OS when the waiter exits. With a server, the server holds the slot until the waiter's connection closes; HTTP/2 keepalive frees it within about 30 seconds if the client vanishes.
 
@@ -640,3 +640,5 @@ dependencies are unavailable; use the `uv` command above to run them.
 All SQL lives in `src/db.rs`, and migrations in `migrations/` are applied automatically when the database is opened. Group archival adds a nullable `bbs_groups.archived_at` column and replaces all-time name uniqueness with a unique partial index for active groups; existing groups remain active. Back up the database before upgrading. Earlier binaries cannot open the upgraded schema; remote clients continue to use the v2 protocol, while `group delete` requires a server advertising `group-archive.v1` and `bbs view` filters require `feed-filter.v1`.
 
 Group descriptions (schema 7) add a nullable `bbs_groups.description` column with a 200-character `CHECK`; existing groups start without one. `group register --description` and `group describe` require a server advertising `group-description.v1` and fail with a capability error against older servers rather than dropping the description. `group register` without a description and `group list` work against either; an older server's listing simply has no descriptions.
+
+Feed indexes (schema 8) add five indexes on `messages` and `deliveries` for `bbs view` filters; no data changes. Earlier binaries cannot open a schema 8 database, so back it up before upgrading the server.
