@@ -352,8 +352,9 @@ carries a `bbs-release.json` manifest:
 unknown one. The manually run `Publish release` workflow on `main` tests, builds
 and writes the manifest for the workflow's commit, refuses a version that is
 already tagged or released, then creates the tag and release. Each new release
-therefore needs a new package version. Releases are not signed: trust rests on
-the repository's administrators and GitHub.
+therefore needs a new package version. The repository uses GitHub immutable
+releases, so a published release's tag and manifest cannot change. Releases are
+not signed: trust rests on the repository's administrators and GitHub.
 
 Install a release's client by its manifest `revision`, which also needs Rust
 `rust_version` or newer:
