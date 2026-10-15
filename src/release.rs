@@ -10,7 +10,7 @@ pub const REVISION: &str = env!("BBS_BUILD_REVISION");
 pub const TARGET: &str = env!("BBS_BUILD_TARGET");
 const DIRTY: Option<&str> = option_env!("BBS_BUILD_DIRTY");
 
-/// Whether tracked files differed from the revision; unknown with the revision.
+/// Whether tracked build inputs differed from the revision; unknown with the revision.
 pub fn dirty() -> Option<bool> {
     DIRTY.and_then(|v| v.parse().ok())
 }
@@ -169,6 +169,11 @@ mod tests {
         assert_eq!(
             build_identity::resolve(None, None, git_rev, || Some(true)),
             Ok((rev.into(), Some(true)))
+        );
+        // An overridden revision ignores git's working tree.
+        assert_eq!(
+            build_identity::resolve(Some(rev), None, unreachable_rev, unreachable_dirty),
+            Ok((rev.into(), None))
         );
         assert_eq!(
             build_identity::resolve(None, None, git_rev, || None),

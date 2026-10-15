@@ -1,7 +1,8 @@
 //! Build identity rules, shared by `build.rs` and its unit tests.
 
-/// The embedded revision (a full commit or `unknown`) and dirty flag. Explicit
-/// overrides win; otherwise git is consulted only as needed. A dirty flag is
+/// The embedded revision (a full commit or `unknown`) and dirty flag. An
+/// overridden revision takes its dirty flag only from the dirty override;
+/// otherwise git is consulted only as needed. A dirty flag is
 /// meaningless without the revision it is relative to, so it is dropped then.
 pub fn resolve(
     revision_override: Option<&str>,
@@ -20,11 +21,12 @@ pub fn resolve(
             .filter(|r| is_full_revision(r))
             .unwrap_or_else(|| "unknown".into()),
     };
+    // Git's working tree says nothing about an overridden revision.
     let dirty = match dirty_override {
         Some("true") => Some(true),
         Some("false") => Some(false),
         Some(v) => return Err(format!("BBS_BUILD_DIRTY must be true or false, not {v:?}")),
-        None if revision != "unknown" => git_dirty(),
+        None if revision_override.is_none() && revision != "unknown" => git_dirty(),
         None => None,
     };
     Ok((revision.clone(), dirty.filter(|_| revision != "unknown")))

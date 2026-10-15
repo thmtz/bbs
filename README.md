@@ -330,7 +330,7 @@ This pinned client reports package version `0.1.0`, which does not uniquely
 identify the build. Use the source revision and image digest for this pair.
 
 Later builds report their identity with `bbs version --json`: package version,
-full source revision, whether tracked files had local changes (`provenance` is
+full source revision, whether tracked build inputs had local changes (`provenance` is
 `clean`, `dirty`, or `unknown`), target, protocol epoch and capabilities, schema
 version, and config format. Builds from a git checkout embed its revision.
 Builds without `.git`, such as the container build, use `BBS_BUILD_REVISION` and

@@ -4,19 +4,22 @@ use std::process::Command;
 #[path = "build/identity.rs"]
 mod identity;
 
+/// Tracked sources of the binary: they trigger rebuilds and define "dirty".
+const INPUTS: &[&str] = &[
+    "proto",
+    "src",
+    "build",
+    "migrations",
+    "build.rs",
+    "Cargo.toml",
+    "Cargo.lock",
+];
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // protox compiles the proto in pure Rust, so the build needs no `protoc`.
     let fds = protox::compile(["proto/bbs.proto"], ["proto"])?;
     tonic_prost_build::configure().compile_fds(fds)?;
-    for path in [
-        "proto",
-        "src",
-        "build",
-        "migrations",
-        "build.rs",
-        "Cargo.toml",
-        "Cargo.lock",
-    ] {
+    for path in INPUTS {
         println!("cargo:rerun-if-changed={path}");
     }
 
@@ -30,7 +33,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         revision_override.as_deref(),
         dirty_override.as_deref(),
         git_revision,
-        || git(&["status", "--porcelain", "--untracked-files=no"]).map(|s| !s.is_empty()),
+        || {
+            let mut args = vec!["status", "--porcelain", "--untracked-files=no", "--"];
+            args.extend(INPUTS);
+            git(&args).map(|s| !s.is_empty())
+        },
     )?;
     println!("cargo:rustc-env=BBS_BUILD_REVISION={revision}");
     if let Some(dirty) = dirty {
@@ -50,12 +57,16 @@ fn git_revision() -> Option<String> {
     if toplevel.canonicalize().ok()? != manifest_dir.canonicalize().ok()? {
         return None;
     }
-    // Rebuild when the checked-out commit, the index, or the current branch
-    // moves. `--git-path` resolves these inside linked worktrees too.
-    let mut paths = vec!["HEAD".to_string(), "index".into(), "packed-refs".into()];
+    // Rebuild when the checked-out commit or the index moves; the HEAD reflog
+    // and loose branch ref record commits, checkouts and resets. `--git-path` resolves these inside
+    // linked worktrees. Cargo treats a missing path as always changed, so only
+    // existing files are watched.
+    let mut paths = vec!["HEAD".to_string(), "logs/HEAD".into(), "index".into()];
     paths.extend(git(&["symbolic-ref", "-q", "HEAD"]));
     for path in paths {
-        if let Some(resolved) = git(&["rev-parse", "--git-path", &path]) {
+        if let Some(resolved) = git(&["rev-parse", "--git-path", &path])
+            && std::path::Path::new(&resolved).exists()
+        {
             println!("cargo:rerun-if-changed={resolved}");
         }
     }
@@ -63,7 +74,12 @@ fn git_revision() -> Option<String> {
 }
 
 fn git(args: &[&str]) -> Option<String> {
-    let output = Command::new("git").args(args).output().ok()?;
+    // Optional locks would let `git status` rewrite the watched index.
+    let output = Command::new("git")
+        .arg("--no-optional-locks")
+        .args(args)
+        .output()
+        .ok()?;
     let stdout = String::from_utf8(output.stdout).ok()?;
     output.status.success().then(|| stdout.trim().to_string())
 }

@@ -3,7 +3,7 @@
 FROM rust:1-bookworm AS build
 WORKDIR /src
 # .git is not copied, so the builder passes the source identity (see build.rs).
-ARG BBS_BUILD_REVISION=unknown
+ARG BBS_BUILD_REVISION
 ARG BBS_BUILD_DIRTY
 COPY . .
 RUN cargo build --release --locked

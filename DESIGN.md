@@ -69,7 +69,8 @@ published releases and client updates are designed in
 
 [src/release.rs](src/release.rs) is the single source of build identity for
 `ServerInfo` and `bbs version`. `build.rs` embeds the full revision of the
-package's own git checkout and whether tracked files differed from it, or takes
+package's own git checkout and whether its tracked build inputs (`src`, `build`,
+`proto`, `migrations`, `build.rs`, and Cargo manifests) differed from it, or takes
 `BBS_BUILD_REVISION` and `BBS_BUILD_DIRTY` from builders without `.git`; an
 unavailable revision is `unknown` with no dirty flag. Only a clean build of a
 known revision can be an official release; dirty and unknown builds are
