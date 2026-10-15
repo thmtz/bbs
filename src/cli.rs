@@ -81,6 +81,9 @@ pub enum Command {
         /// Block until at least one unread message arrives, then print it.
         #[arg(long, conflicts_with = "archived")]
         wait: bool,
+        /// Print one JSON object per message (JSONL) instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// Watch every message on the board as it flows (humans only; read-only).
     View,
@@ -140,6 +143,9 @@ pub enum Command {
         /// Include retired agents (humans only).
         #[arg(long)]
         all: bool,
+        /// Print one JSON object per human or agent (JSONL) instead of a table.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -181,7 +187,11 @@ pub enum GroupCommand {
     /// Remove an agent from a group (humans only).
     Remove { group: String, agent: String },
     /// List groups and their members.
-    List,
+    List {
+        /// Print one JSON object per group (JSONL) instead of text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
