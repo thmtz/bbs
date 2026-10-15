@@ -122,6 +122,10 @@ pub enum Command {
         /// Print one JSON object.
         #[arg(long)]
         json: bool,
+        /// Print this build's release manifest (bbs-release.json); fails unless
+        /// the build is a clean, known revision.
+        #[arg(long, conflicts_with = "json")]
+        manifest: bool,
     },
     /// Back up a local server database, including while it is running.
     Backup {

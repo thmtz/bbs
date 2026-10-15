@@ -48,8 +48,8 @@ fn init_logging() {
 async fn main() -> ExitCode {
     let cli = cli::Cli::parse();
     // Handled before logging, which creates ~/bbs.log, so it has no side effects.
-    let result = if let cli::Command::Version { json } = cli.command {
-        release::print(json)
+    let result = if let cli::Command::Version { json, manifest } = cli.command {
+        release::print(json, manifest)
     } else {
         init_logging();
         app::run(cli).await

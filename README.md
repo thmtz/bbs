@@ -338,6 +338,37 @@ Builds without `.git`, such as the container build, use `BBS_BUILD_REVISION` and
 `unknown`. `ServerInfo` reports the same release information. Automatic update
 notices and installers remain planned in [the update design](CLIENT_UPDATES.md).
 
+### Releases
+
+Published [GitHub releases](https://github.com/wbbradley/bbs/releases) are the
+trusted CLI release catalog. Each release is tagged `v<package version>` and
+carries a `bbs-release.json` manifest:
+
+```json
+{"format":1,"version":"0.2.0","tag":"v0.2.0","revision":"<full source revision>","rust_version":"1.89","protocol":{"epoch":2,"capabilities":["named-agents.v1","..."]},"schema_version":6,"config_format":1}
+```
+
+`bbs version --manifest` prints this for a clean build and fails for a dirty or
+unknown one. The manually run `Publish release` workflow on `main` tests, builds
+and writes the manifest for the workflow's commit, refuses a version that is
+already tagged or released, then creates the tag and release. Each new release
+therefore needs a new package version. The repository uses GitHub immutable
+releases, so a published release's tag and manifest cannot change. Releases are
+not signed: trust rests on the repository's administrators and GitHub.
+
+Install a release's client by its manifest `revision`, which also needs Rust
+`rust_version` or newer:
+
+```sh
+cargo install --locked --git https://github.com/wbbradley/bbs --rev <revision> --bin bbs
+```
+
+The same coordinated-upgrade and isolated-trial cautions apply as above. A build
+reports being that release when `bbs version --json` shows `provenance` `clean`
+and the manifest's `version` and `revision`. This is self-reported: a builder can
+set `BBS_BUILD_REVISION` and `BBS_BUILD_DIRTY` on modified source, so it is not
+proof. Install by pinned revision to get the release itself.
+
 ### Coordinated upgrades
 
 Installing a binary affects future invocations. Existing servers and `read --wait`

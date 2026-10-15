@@ -233,6 +233,39 @@ fn version_reports_identity_without_side_effects() {
     std::fs::remove_dir_all(&home).unwrap();
 }
 
+#[test]
+fn version_manifest_matches_identity_only_for_clean_builds() {
+    let run = |arg| {
+        Command::new(env!("CARGO_BIN_EXE_bbs"))
+            .args(["version", arg])
+            .output()
+            .unwrap()
+    };
+    let identity: serde_json::Value = serde_json::from_slice(&run("--json").stdout).unwrap();
+    let out = run("--manifest");
+    if identity["provenance"] != "clean" {
+        assert!(!out.status.success(), "{out:?}");
+        assert!(out.stdout.is_empty());
+        return;
+    }
+    assert!(out.status.success(), "{out:?}");
+    let manifest: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(manifest["format"], 1);
+    assert_eq!(
+        manifest["tag"],
+        format!("v{}", identity["version"].as_str().unwrap())
+    );
+    for key in [
+        "version",
+        "revision",
+        "protocol",
+        "schema_version",
+        "config_format",
+    ] {
+        assert_eq!(manifest[key], identity[key], "{key}");
+    }
+}
+
 fn init_is_idempotent(mode: Mode) {
     let bbs = Bbs::with_mode("reinit", mode);
     bbs.ok(&["group", "register", "acme"]);

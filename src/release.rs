@@ -8,6 +8,9 @@ use crate::{config, db, proto, protocol};
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const REVISION: &str = env!("BBS_BUILD_REVISION");
 pub const TARGET: &str = env!("BBS_BUILD_TARGET");
+const RUST_VERSION: &str = env!("CARGO_PKG_RUST_VERSION");
+/// Version of the `bbs-release.json` layout; bump on incompatible changes.
+const MANIFEST_FORMAT: u32 = 1;
 /// `true`, `false`, or empty when unknown.
 const DIRTY: &str = env!("BBS_BUILD_DIRTY");
 
@@ -70,6 +73,47 @@ struct Report {
     config_format: u32,
 }
 
+/// The `bbs-release.json` asset of a published release: what a trusted catalog
+/// entry promises about the release's source and compatibility.
+#[derive(Serialize)]
+struct Manifest {
+    format: u32,
+    version: &'static str,
+    tag: String,
+    revision: &'static str,
+    rust_version: &'static str,
+    protocol: Protocol,
+    schema_version: usize,
+    config_format: u32,
+}
+
+/// Only clean builds of a known revision describe a publishable release.
+fn manifest(revision: &'static str, dirty: Option<bool>) -> anyhow::Result<Manifest> {
+    let provenance = Provenance::of(revision, dirty);
+    anyhow::ensure!(
+        provenance == Provenance::Clean,
+        "a release manifest needs a clean build of a known revision; this build is {}",
+        format!("{provenance:?}").to_lowercase(),
+    );
+    Ok(Manifest {
+        format: MANIFEST_FORMAT,
+        version: VERSION,
+        tag: format!("v{VERSION}"),
+        revision,
+        rust_version: RUST_VERSION,
+        protocol: protocol(),
+        schema_version: db::SCHEMA_VERSION,
+        config_format: config::FORMAT,
+    })
+}
+
+fn protocol() -> Protocol {
+    Protocol {
+        epoch: protocol::EPOCH,
+        capabilities: protocol::CAPABILITIES,
+    }
+}
+
 fn report() -> Report {
     Report {
         version: VERSION,
@@ -77,10 +121,7 @@ fn report() -> Report {
         dirty: dirty(),
         provenance: Provenance::of(REVISION, dirty()),
         target: TARGET,
-        protocol: Protocol {
-            epoch: protocol::EPOCH,
-            capabilities: protocol::CAPABILITIES,
-        },
+        protocol: protocol(),
         schema_version: db::SCHEMA_VERSION,
         config_format: config::FORMAT,
     }
@@ -88,7 +129,14 @@ fn report() -> Report {
 
 /// `bbs version`: reads only compiled-in constants, so it opens no files,
 /// configuration, database or connection.
-pub fn print(json: bool) -> anyhow::Result<()> {
+pub fn print(json: bool, manifest: bool) -> anyhow::Result<()> {
+    if manifest {
+        println!(
+            "{}",
+            serde_json::to_string(&self::manifest(REVISION, dirty())?)?
+        );
+        return Ok(());
+    }
     let report = report();
     if json {
         println!("{}", serde_json::to_string(&report)?);
@@ -150,6 +198,28 @@ mod tests {
         assert_eq!(value["schema_version"], db::SCHEMA_VERSION);
         assert_eq!(value["config_format"], config::FORMAT);
         assert!(REVISION == "unknown" || REVISION.len() == 40);
+    }
+
+    #[test]
+    fn manifest_requires_clean_known_revision() {
+        let rev = "0123456789abcdef0123456789abcdef01234567";
+        let value = serde_json::to_value(manifest(rev, Some(false)).unwrap()).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "format": 1,
+                "version": VERSION,
+                "tag": format!("v{VERSION}"),
+                "revision": rev,
+                "rust_version": env!("CARGO_PKG_RUST_VERSION"),
+                "protocol": {"epoch": protocol::EPOCH, "capabilities": protocol::CAPABILITIES},
+                "schema_version": db::SCHEMA_VERSION,
+                "config_format": config::FORMAT,
+            })
+        );
+        for (revision, dirty) in [(rev, Some(true)), (rev, None), ("unknown", Some(false))] {
+            assert!(manifest(revision, dirty).is_err());
+        }
     }
 
     #[test]
