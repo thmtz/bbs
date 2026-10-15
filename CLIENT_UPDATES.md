@@ -124,6 +124,20 @@ A protocol epoch change uses a new wire namespace and an explicit migration;
 never replay a failed write automatically after updating. Old v1 clients and
 servers fail clearly rather than pretending to negotiate this contract.
 
+### Server replacement
+
+Do not add a separate operator readiness command, connected-client inventory, or
+client-dependent veto of a server deployment. Replacing the server closes its
+existing connections through the normal shutdown path. The replacement server
+enforces the request contract when clients reconnect: supported requests proceed,
+and incompatible requests fail before application work with the supported epoch,
+missing capabilities, or minimum client version needed to explain the failure.
+Clients surface that incompatibility through their normal error path and must not
+retry it indefinitely or fall back to an older write protocol. Legacy clients may
+only see an unimplemented-service error during the initial protocol transition.
+This does not add client re-execution, automatic server updates, stream resumption,
+or automatic replay of writes interrupted by deployment.
+
 ## Bootstrap
 
 Existing installed binaries have no update checker. The first compatible release
@@ -387,6 +401,8 @@ for version discovery and notifications.
 | Missing/malformed epoch, or missing version with configured minimum | Reject application calls; health/info still available |
 | Epoch mismatch or missing required capability | Reject before mutation; no write replay after update |
 | Endpoint downgrades/reconnects after discovery | Request contract or new RPC namespace rejects before mutation |
+| Server is replaced while clients are connected | Normal shutdown closes connections; replacement validates reconnecting clients without a deployment readiness gate |
+| Reconnecting client is incompatible | Explain mismatch through normal error path; no indefinite retry, write replay, or protocol fallback |
 | Connected server never answers ServerInfo | Explicit RPC deadline expires; do not hang the harness |
 | Discovery returns unimplemented/authentication/unavailable status | Preserve status code and distinguish upgrade from authentication/connectivity |
 | Unary error, idle stream, completed stream | Hints collected on status/initial headers; no wait for stream completion |
@@ -414,7 +430,8 @@ for version discovery and notifications.
    version module and side-effect-free CLI output, extend `proto/bbs.proto` and
    server/backend negotiation and typed status handling. Update the service
    namespace and health configuration together; test old/new responses, endpoint
-   replacement and rejection before mutation. Define and CI-test the minimum supported Rust version using Cargo's
+   replacement, incompatible reconnect errors without retry loops, and rejection
+   before mutation. Define and CI-test the minimum supported Rust version using Cargo's
    [`rust-version` field](https://doc.rust-lang.org/cargo/reference/manifest.html#the-rust-version-field).
 2. **Release catalog publication.** Add a manually authorized CLI release workflow
    and manifest validation, immutable version/revision checks, compatibility
