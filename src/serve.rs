@@ -20,6 +20,7 @@ use tonic::{Request, Response, Status};
 use crate::db;
 use crate::proto::bbs_server::{Bbs, BbsServer};
 use crate::proto::{self, Kind};
+use crate::protocol::Policy;
 use crate::service::{self, Caller};
 
 /// Keepalive pings let a vanished client free its waiter slot within ~30s.
@@ -30,11 +31,16 @@ const WAIT_TOUCH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// Leave time for process teardown within a ten-second container grace period.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(8);
 
-pub async fn run(listen: SocketAddr, dir: &Path, require_human_token: bool) -> Result<()> {
+pub async fn run(
+    listen: SocketAddr,
+    dir: &Path,
+    require_human_token: bool,
+    protocol: Policy,
+) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let mut conn = db::open(&dir.join("bbs.db"))?;
     db::migrate(&mut conn)?;
-    serve(conn, listen, dir, require_human_token).await
+    serve(conn, listen, dir, require_human_token, protocol).await
 }
 
 async fn serve(
@@ -42,6 +48,7 @@ async fn serve(
     listen: SocketAddr,
     dir: &Path,
     require_human_token: bool,
+    protocol: Policy,
 ) -> Result<()> {
     let signal = shutdown_signal()?;
     let listener = tokio::net::TcpListener::bind(listen)
@@ -54,6 +61,7 @@ async fn serve(
         waiters: Mutex::new(HashSet::new()),
         shutdown: watch::Sender::new(false),
         require_human_token,
+        protocol,
         auth_failures: Mutex::new(HashMap::new()),
     });
     let (health, health_service) = tonic_health::server::health_reporter();
@@ -112,6 +120,7 @@ struct State {
     waiters: Mutex<HashSet<(i32, i64)>>,
     shutdown: watch::Sender<bool>,
     require_human_token: bool,
+    protocol: Policy,
     auth_failures: Mutex<HashMap<IpAddr, (Instant, u32)>>,
 }
 
@@ -358,28 +367,33 @@ impl Server {
         T: Send + 'static,
         F: FnOnce(&mut Connection, &Caller, Req) -> Result<T> + Send + 'static,
     {
-        let peer = req.remote_addr().map(|addr| addr.ip());
-        let caller = Arc::new(caller(&req, self.0.require_human_token));
-        self.0.enforce_auth_rate(peer, &caller).await?;
-        if self.0.require_human_token && matches!(rpc, "ensure_human" | "add_human") {
-            return Err(Status::permission_denied(
-                "human accounts must be provisioned with local `bbs admin human` commands",
-            ));
-        }
-        let req = req.into_inner();
-        let c = caller.clone();
-        let out = match self.0.call(move |conn| f(conn, &c, req)).await {
-            Ok(out) => out,
-            Err(status) => {
-                self.0.record_auth_failure(peer, &status);
-                self.0.warn_failed(rpc, &caller, &status).await;
-                return Err(status);
+        self.0.protocol.validate(req.metadata())?;
+        let result = async {
+            let peer = req.remote_addr().map(|addr| addr.ip());
+            let caller = Arc::new(caller(&req, self.0.require_human_token));
+            self.0.enforce_auth_rate(peer, &caller).await?;
+            if self.0.require_human_token && matches!(rpc, "ensure_human" | "add_human") {
+                return Err(Status::permission_denied(
+                    "human accounts must be provisioned with local `bbs admin human` commands",
+                ));
             }
-        };
-        if effect == Effect::Write {
-            self.0.changed();
+            let req = req.into_inner();
+            let c = caller.clone();
+            let out = match self.0.call(move |conn| f(conn, &c, req)).await {
+                Ok(out) => out,
+                Err(status) => {
+                    self.0.record_auth_failure(peer, &status);
+                    self.0.warn_failed(rpc, &caller, &status).await;
+                    return Err(status);
+                }
+            };
+            if effect == Effect::Write {
+                self.0.changed();
+            }
+            Ok(Response::new(out))
         }
-        Ok(Response::new(out))
+        .await;
+        self.0.protocol.finish(result)
     }
 }
 
@@ -390,6 +404,7 @@ struct CancellableStream<T> {
     messages: ReceiverStream<Result<T, Status>>,
     terminal: Option<oneshot::Receiver<Status>>,
     done: bool,
+    protocol: Policy,
 }
 
 impl<T> Stream for CancellableStream<T> {
@@ -409,13 +424,15 @@ impl<T> Stream for CancellableStream<T> {
                 Poll::Ready(Ok(status)) => {
                     this.done = true;
                     this.messages.close();
-                    return Poll::Ready(Some(Err(status)));
+                    return Poll::Ready(Some(Err(this.protocol.status(status))));
                 }
                 Poll::Ready(Err(_)) => this.terminal = None,
                 Poll::Pending => {}
             }
         }
-        Pin::new(&mut this.messages).poll_next(cx)
+        Pin::new(&mut this.messages)
+            .poll_next(cx)
+            .map(|item| item.map(|result| result.map_err(|status| this.protocol.status(status))))
     }
 }
 
@@ -425,9 +442,9 @@ impl Bbs for Server {
         &self,
         _req: Request<proto::Empty>,
     ) -> Result<Response<proto::ServerInfoResponse>, Status> {
-        Ok(Response::new(proto::ServerInfoResponse {
-            require_human_token: self.0.require_human_token,
-        }))
+        self.0.protocol.finish(Ok(Response::new(
+            self.0.protocol.info(self.0.require_human_token),
+        )))
     }
 
     async fn ensure_human(
@@ -566,53 +583,61 @@ impl Bbs for Server {
         &self,
         req: Request<proto::WaitRequest>,
     ) -> Result<Response<Self::WaitForMailStream>, Status> {
-        let peer = req.remote_addr().map(|addr| addr.ip());
-        let caller = caller(&req, self.0.require_human_token);
-        self.0.enforce_auth_rate(peer, &caller).await?;
-        let limit = req.into_inner().limit;
-        let c = caller.clone();
-        let claim = async {
-            let me = self.0.call(move |conn| service::whoami(conn, &c)).await?;
-            // Claim before returning, so a second waiter fails immediately.
-            let slot = Slot::claim(&self.0, &me)?;
-            Ok::<_, Status>((me, slot))
-        };
-        let (me, slot) = match claim.await {
-            Ok(claimed) => claimed,
-            Err(status) => {
-                self.0.record_auth_failure(peer, &status);
-                self.0.warn_failed("wait_for_mail", &caller, &status).await;
-                return Err(status);
-            }
-        };
-        let (tx, rx) = mpsc::channel(16);
-        let (terminal, terminal_rx) = oneshot::channel();
-        let state = self.0.clone();
-        tokio::spawn(async move {
-            let _slot = slot;
-            let caller = Arc::new(caller);
-            tokio::select! {
-                _ = state.stopping() => {
-                    let _ = terminal.send(Status::unavailable("server is shutting down"));
-                },
-                status = state.watch_credentials(caller.clone()) => {
-                    state.record_auth_failure(peer, &status);
-                    let _ = terminal.send(status);
-                },
-                _ = async {
-                    if let Err(status) = state.wait(caller.clone(), me, limit, &tx).await {
+        self.0.protocol.validate(req.metadata())?;
+        let result = async {
+            let peer = req.remote_addr().map(|addr| addr.ip());
+            let caller = caller(&req, self.0.require_human_token);
+            self.0.enforce_auth_rate(peer, &caller).await?;
+            let limit = req.into_inner().limit;
+            let c = caller.clone();
+            let claim = async {
+                let me = self.0.call(move |conn| service::whoami(conn, &c)).await?;
+                // Claim before returning, so a second waiter fails immediately.
+                let slot = Slot::claim(&self.0, &me)?;
+                Ok::<_, Status>((me, slot))
+            };
+            let (me, slot) = match claim.await {
+                Ok(claimed) => claimed,
+                Err(status) => {
+                    self.0.record_auth_failure(peer, &status);
+                    self.0.warn_failed("wait_for_mail", &caller, &status).await;
+                    return Err(status);
+                }
+            };
+            let (tx, rx) = mpsc::channel(16);
+            let (terminal, terminal_rx) = oneshot::channel();
+            let state = self.0.clone();
+            tokio::spawn(async move {
+                let _slot = slot;
+                let caller = Arc::new(caller);
+                tokio::select! {
+                    _ = state.stopping() => {
+                        let _ = terminal.send(Status::unavailable("server is shutting down"));
+                    },
+                    status = state.watch_credentials(caller.clone()) => {
                         state.record_auth_failure(peer, &status);
-                        state.warn_failed("wait_for_mail", &caller, &status).await;
-                        let _ = tx.send(Err(status)).await;
-                    }
-                } => {},
-            }
-        });
-        Ok(Response::new(Box::pin(CancellableStream {
-            messages: ReceiverStream::new(rx),
-            terminal: Some(terminal_rx),
-            done: false,
-        })))
+                        let _ = terminal.send(status);
+                    },
+                    _ = async {
+                        if let Err(status) = state.wait(caller.clone(), me, limit, &tx).await {
+                            state.record_auth_failure(peer, &status);
+                            state.warn_failed("wait_for_mail", &caller, &status).await;
+                            let _ = tx.send(Err(status)).await;
+                        }
+                    } => {},
+                }
+            });
+            Ok(Response::<Self::WaitForMailStream>::new(Box::pin(
+                CancellableStream {
+                    messages: ReceiverStream::new(rx),
+                    terminal: Some(terminal_rx),
+                    done: false,
+                    protocol: self.0.protocol.clone(),
+                },
+            )))
+        }
+        .await;
+        self.0.protocol.finish(result)
     }
 
     async fn list_agents(
@@ -629,60 +654,68 @@ impl Bbs for Server {
         &self,
         req: Request<proto::FeedRequest>,
     ) -> Result<Response<Self::WatchFeedStream>, Status> {
-        let peer = req.remote_addr().map(|addr| addr.ip());
-        let caller = Arc::new(caller(&req, self.0.require_human_token));
-        self.0.enforce_auth_rate(peer, &caller).await?;
-        let req = req.into_inner();
-        let state = self.0.clone();
-        let mut changes = state.notify.subscribe();
-        // The first snapshot also checks the caller is a human, before the stream opens.
-        let c = caller.clone();
-        let first = match state.call(move |conn| service::feed(conn, &c, req)).await {
-            Ok(first) => first,
-            Err(status) => {
-                state.record_auth_failure(peer, &status);
-                state.warn_failed("watch_feed", &caller, &status).await;
-                return Err(status);
-            }
-        };
-        let (tx, rx) = mpsc::channel(4);
-        let (terminal, terminal_rx) = oneshot::channel();
-        tokio::spawn(async move {
-            let send_snapshots = async {
-                let mut snapshot = Ok(first);
-                loop {
-                    if let Err(status) = &snapshot {
-                        state.warn_failed("watch_feed", &caller, status).await;
-                    }
-                    let failed = snapshot.is_err();
-                    if tx.send(snapshot).await.is_err() || failed {
-                        return;
-                    }
-                    tokio::select! {
-                        _ = changes.changed() => {}
-                        _ = tx.closed() => return,
-                    }
-                    changes.borrow_and_update();
-                    let c = caller.clone();
-                    snapshot = state.call(move |conn| service::feed(conn, &c, req)).await;
+        self.0.protocol.validate(req.metadata())?;
+        let result = async {
+            let peer = req.remote_addr().map(|addr| addr.ip());
+            let caller = Arc::new(caller(&req, self.0.require_human_token));
+            self.0.enforce_auth_rate(peer, &caller).await?;
+            let req = req.into_inner();
+            let state = self.0.clone();
+            let mut changes = state.notify.subscribe();
+            // The first snapshot also checks the caller is a human, before the stream opens.
+            let c = caller.clone();
+            let first = match state.call(move |conn| service::feed(conn, &c, req)).await {
+                Ok(first) => first,
+                Err(status) => {
+                    state.record_auth_failure(peer, &status);
+                    state.warn_failed("watch_feed", &caller, &status).await;
+                    return Err(status);
                 }
             };
-            tokio::select! {
-                _ = state.stopping() => {
-                    let _ = terminal.send(Status::unavailable("server is shutting down"));
+            let (tx, rx) = mpsc::channel(4);
+            let (terminal, terminal_rx) = oneshot::channel();
+            tokio::spawn(async move {
+                let send_snapshots = async {
+                    let mut snapshot = Ok(first);
+                    loop {
+                        if let Err(status) = &snapshot {
+                            state.warn_failed("watch_feed", &caller, status).await;
+                        }
+                        let failed = snapshot.is_err();
+                        if tx.send(snapshot).await.is_err() || failed {
+                            return;
+                        }
+                        tokio::select! {
+                            _ = changes.changed() => {}
+                            _ = tx.closed() => return,
+                        }
+                        changes.borrow_and_update();
+                        let c = caller.clone();
+                        snapshot = state.call(move |conn| service::feed(conn, &c, req)).await;
+                    }
+                };
+                tokio::select! {
+                    _ = state.stopping() => {
+                        let _ = terminal.send(Status::unavailable("server is shutting down"));
+                    },
+                    status = state.watch_credentials(caller.clone()) => {
+                        state.record_auth_failure(peer, &status);
+                        let _ = terminal.send(status);
+                    },
+                    _ = send_snapshots => {},
+                }
+            });
+            Ok(Response::<Self::WatchFeedStream>::new(Box::pin(
+                CancellableStream {
+                    messages: ReceiverStream::new(rx),
+                    terminal: Some(terminal_rx),
+                    done: false,
+                    protocol: self.0.protocol.clone(),
                 },
-                status = state.watch_credentials(caller.clone()) => {
-                    state.record_auth_failure(peer, &status);
-                    let _ = terminal.send(status);
-                },
-                _ = send_snapshots => {},
-            }
-        });
-        Ok(Response::new(Box::pin(CancellableStream {
-            messages: ReceiverStream::new(rx),
-            terminal: Some(terminal_rx),
-            done: false,
-        })))
+            )))
+        }
+        .await;
+        self.0.protocol.finish(result)
     }
 
     async fn bind_session(
@@ -711,6 +744,81 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn protocol_rejection_precedes_auth_budget_identity_lookup() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::migrate(&mut conn).unwrap();
+        service::ensure_human(
+            &mut conn,
+            proto::EnsureHumanRequest {
+                name: "will".into(),
+            },
+        )
+        .unwrap();
+        let before = "2001-01-01T00:00:00.000000Z";
+        conn.execute("UPDATE humans SET active_at = ?1", [before])
+            .unwrap();
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let state = Arc::new(State {
+            conn: Mutex::new(conn),
+            notify: watch::Sender::new(0),
+            waiters: Mutex::new(HashSet::new()),
+            shutdown: watch::Sender::new(false),
+            require_human_token: false,
+            protocol: Policy::default(),
+            auth_failures: Mutex::new(HashMap::from([(peer.ip(), (Instant::now(), 20))])),
+        });
+        let server = Server(state.clone());
+        let request = || {
+            let mut req = Request::new(proto::Empty {});
+            req.metadata_mut()
+                .insert("bbs-human", "will".parse().unwrap());
+            req.extensions_mut()
+                .insert(tonic::transport::server::TcpConnectInfo {
+                    local_addr: None,
+                    remote_addr: Some(peer),
+                });
+            req
+        };
+        assert_eq!(
+            server.whoami(request()).await.unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+        let (metadata, extensions, _) = request().into_parts();
+        assert!(
+            server
+                .wait_for_mail(Request::from_parts(
+                    metadata.clone(),
+                    extensions.clone(),
+                    proto::WaitRequest { limit: None }
+                ))
+                .await
+                .is_err()
+        );
+        assert!(
+            server
+                .watch_feed(Request::from_parts(
+                    metadata,
+                    extensions,
+                    proto::FeedRequest { backlog: 10 }
+                ))
+                .await
+                .is_err()
+        );
+        let after: String = state
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT active_at FROM humans WHERE name = 'will'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, before);
+        assert!(state.waiters.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn terminal_error_bypasses_full_message_buffer() {
         use tokio_stream::StreamExt;
         let (tx, rx) = mpsc::channel(1);
@@ -720,6 +828,7 @@ mod tests {
             messages: ReceiverStream::new(rx),
             terminal: Some(terminal_rx),
             done: false,
+            protocol: Policy::default(),
         };
         terminal.send(Status::unauthenticated("revoked")).unwrap();
         assert_eq!(
@@ -741,6 +850,7 @@ mod tests {
             waiters: Mutex::new(HashSet::new()),
             shutdown: watch::Sender::new(false),
             require_human_token: false,
+            protocol: Policy::default(),
             auth_failures: Mutex::new(HashMap::new()),
         });
         let (started, active) = tokio::sync::oneshot::channel();

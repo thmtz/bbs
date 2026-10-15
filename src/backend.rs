@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, Endpoint};
@@ -13,6 +13,7 @@ use tonic::transport::{Channel, Endpoint};
 use crate::config::Config;
 use crate::db;
 use crate::proto::{self, bbs_client::BbsClient};
+use crate::protocol;
 use crate::service::{self, Caller};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -70,8 +71,9 @@ impl Remote {
     }
 
     /// Wrap `msg` in a request carrying the caller's identity.
-    fn request<T>(&self, msg: T) -> Result<tonic::Request<T>> {
+    fn request<T>(&self, msg: T, capabilities: &[&str]) -> Result<tonic::Request<T>> {
         let mut req = tonic::Request::new(msg);
+        protocol::client_metadata(req.metadata_mut(), capabilities);
         if self.caller.token.is_none()
             && let Some(token) = &self.caller.human_token
         {
@@ -94,13 +96,21 @@ impl Remote {
 
 /// The server sends the service's error text as the status message.
 fn status_error(status: tonic::Status) -> anyhow::Error {
-    anyhow!("{}", status.message())
+    let message = if status.code() == tonic::Code::Unimplemented {
+        "BBS v2 service is unavailable; coordinate a client/server upgrade".to_string()
+    } else {
+        status.message().to_string()
+    };
+    anyhow::Error::new(status).context(message)
 }
 
 /// One unary RPC: `rpc!(remote, method, request)`.
 macro_rules! rpc {
-    ($remote:expr, $method:ident, $msg:expr) => {{
-        let req = $remote.request($msg)?;
+    ($remote:expr, $method:ident, $msg:expr) => {
+        rpc!($remote, $method, $msg, &[])
+    };
+    ($remote:expr, $method:ident, $msg:expr, $caps:expr) => {{
+        let req = $remote.request($msg, $caps)?;
         $remote
             .client
             .$method(req)
@@ -153,7 +163,14 @@ impl Backend {
     ) -> Result<proto::RegisterResponse> {
         match self {
             Backend::Local(l) => service::register(&mut l.conn, &l.caller, req),
-            Backend::Remote(r) => rpc!(r, register, req),
+            Backend::Remote(r) => {
+                let capabilities: &[&str] = if req.name.is_some() {
+                    &["named-agents.v1"]
+                } else {
+                    &[]
+                };
+                rpc!(r, register, req, capabilities)
+            }
         }
     }
 
@@ -166,10 +183,20 @@ impl Backend {
 
     pub async fn server_info(&mut self) -> Result<proto::ServerInfoResponse> {
         match self {
-            Backend::Remote(r) => rpc!(r, server_info, proto::Empty {}),
-            Backend::Local(_) => Ok(proto::ServerInfoResponse {
-                require_human_token: false,
-            }),
+            Backend::Remote(r) => {
+                let mut req = r.request(proto::Empty {}, &[])?;
+                req.set_timeout(CONNECT_TIMEOUT);
+                let response = tokio::time::timeout(CONNECT_TIMEOUT, r.client.server_info(req))
+                    .await
+                    .map_err(|_| {
+                        status_error(tonic::Status::deadline_exceeded("BBS ServerInfo timed out"))
+                    })?
+                    .map_err(status_error)?;
+                let info = response.into_inner();
+                protocol::validate_info(&info)?;
+                Ok(info)
+            }
+            Backend::Local(_) => Ok(protocol::Policy::default().info(false)),
         }
     }
 
@@ -248,7 +275,7 @@ impl Backend {
     pub async fn read(&mut self, req: proto::ReadRequest) -> Result<proto::ReadResponse> {
         match self {
             Backend::Local(l) => service::read(&mut l.conn, &l.caller, req),
-            Backend::Remote(r) => rpc!(r, read, req),
+            Backend::Remote(r) => rpc!(r, read, req, &["owner-attribution.v1"]),
         }
     }
 
@@ -268,7 +295,7 @@ impl Backend {
     ) -> Result<proto::BindSessionResponse> {
         match self {
             Backend::Local(l) => service::bind_session(&mut l.conn, &l.caller, req),
-            Backend::Remote(r) => rpc!(r, bind_session, req),
+            Backend::Remote(r) => rpc!(r, bind_session, req, &["human-token-sessions.v1"]),
         }
     }
 
@@ -278,7 +305,7 @@ impl Backend {
     ) -> Result<proto::SessionAgentResponse> {
         match self {
             Backend::Local(l) => service::session_agent(&mut l.conn, &l.caller, req),
-            Backend::Remote(r) => rpc!(r, session_agent, req),
+            Backend::Remote(r) => rpc!(r, session_agent, req, &["human-token-sessions.v1"]),
         }
     }
 
@@ -293,7 +320,9 @@ impl Backend {
                 seen: None,
                 next_poll: tokio::time::Instant::now(),
             },
-            Backend::Remote(r) => FeedWatch::Remote(rpc!(r, watch_feed, req)?),
+            Backend::Remote(r) => {
+                FeedWatch::Remote(rpc!(r, watch_feed, req, &["owner-attribution.v1"])?)
+            }
         })
     }
 
@@ -303,7 +332,12 @@ impl Backend {
         match self {
             Backend::Local(l) => l.wait_for_mail(limit).await,
             Backend::Remote(r) => {
-                let mut stream = rpc!(r, wait_for_mail, proto::WaitRequest { limit })?;
+                let mut stream = rpc!(
+                    r,
+                    wait_for_mail,
+                    proto::WaitRequest { limit },
+                    &["owner-attribution.v1"]
+                )?;
                 let mut msgs = Vec::new();
                 while let Some(m) = stream.message().await.map_err(status_error)? {
                     msgs.push(m);
@@ -432,6 +466,215 @@ fn lock_waiter(me: &db::Principal, dir: &Path) -> Result<std::fs::File> {
         }
         Err(std::fs::TryLockError::Error(err)) => {
             Err(err).with_context(|| format!("locking {}", path.display()))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::convert::Infallible;
+    use std::pin::Pin;
+    use std::task::{Context as TaskContext, Poll};
+    use tonic::body::Body;
+    use tonic::codegen::{BoxFuture, Bytes, Service, http};
+
+    #[test]
+    fn status_conversion_retains_code_and_metadata() {
+        for code in [
+            tonic::Code::Unimplemented,
+            tonic::Code::Unauthenticated,
+            tonic::Code::Unavailable,
+            tonic::Code::FailedPrecondition,
+        ] {
+            let mut original = tonic::Status::new(code, "test failure");
+            original
+                .metadata_mut()
+                .insert("bbs-protocol-epoch", "2".parse().unwrap());
+            let error = status_error(original);
+            let status = error.downcast_ref::<tonic::Status>().unwrap();
+            assert_eq!(status.code(), code);
+            assert_eq!(status.metadata().get("bbs-protocol-epoch").unwrap(), "2");
+            if code == tonic::Code::Unimplemented {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("coordinate a client/server upgrade")
+                );
+            }
+        }
+    }
+
+    struct PendingBody;
+    impl http_body::Body for PendingBody {
+        type Data = Bytes;
+        type Error = Infallible;
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _: &mut TaskContext<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Bytes>, Infallible>>> {
+            Poll::Pending
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingService(std::sync::Arc<std::sync::Mutex<Vec<(String, http::HeaderMap)>>>);
+    impl tonic::server::NamedService for RecordingService {
+        const NAME: &'static str = "bbs.v2.Bbs";
+    }
+    impl Service<http::Request<Body>> for RecordingService {
+        type Response = http::Response<Body>;
+        type Error = Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(&mut self, _: &mut TaskContext<'_>) -> Poll<Result<(), Infallible>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, req: http::Request<Body>) -> Self::Future {
+            self.0
+                .lock()
+                .unwrap()
+                .push((req.uri().path().to_owned(), req.headers().clone()));
+            Box::pin(async { Ok(tonic::Status::failed_precondition("recorded").into_http()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_sends_required_capabilities_without_discovery_or_retries() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let recording = RecordingService::default();
+        let observations = recording.0.clone();
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(recording)
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let remote = Remote::connect(&address.to_string(), Caller::default())
+            .await
+            .unwrap();
+        let mut backend = Backend::Remote(remote);
+        assert!(
+            backend
+                .ensure_human(proto::EnsureHumanRequest {
+                    name: "test".into()
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
+                .register(proto::RegisterRequest {
+                    name: Some("Named".into()),
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
+                .register(proto::RegisterRequest::default())
+                .await
+                .is_err()
+        );
+        assert!(backend.read(proto::ReadRequest::default()).await.is_err());
+        assert!(backend.wait_for_mail(None).await.is_err());
+        assert!(backend.watch_feed(10).await.is_err());
+        assert!(
+            backend
+                .bind_session(proto::BindSessionRequest::default())
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
+                .session_agent(proto::SessionAgentRequest::default())
+                .await
+                .is_err()
+        );
+        server.abort();
+        let expected = [
+            ("EnsureHuman", None),
+            ("Register", Some("named-agents.v1")),
+            ("Register", None),
+            ("Read", Some("owner-attribution.v1")),
+            ("WaitForMail", Some("owner-attribution.v1")),
+            ("WatchFeed", Some("owner-attribution.v1")),
+            ("BindSession", Some("human-token-sessions.v1")),
+            ("SessionAgent", Some("human-token-sessions.v1")),
+        ];
+        let observed = observations.lock().unwrap();
+        assert_eq!(
+            observed.len(),
+            expected.len(),
+            "no preflight or automatic retry"
+        );
+        for ((path, headers), (method, capabilities)) in observed.iter().zip(expected) {
+            assert_eq!(path, &format!("/bbs.v2.Bbs/{method}"));
+            assert_eq!(headers["bbs-protocol-epoch"], "2");
+            assert_eq!(headers["bbs-client-version"], env!("CARGO_PKG_VERSION"));
+            assert_eq!(
+                headers
+                    .get("bbs-required-capabilities")
+                    .map(|v| v.to_str().unwrap()),
+                capabilities
+            );
+        }
+    }
+
+    #[derive(Clone)]
+    struct StalledInfo {
+        send_headers: bool,
+    }
+    impl tonic::server::NamedService for StalledInfo {
+        const NAME: &'static str = "bbs.v2.Bbs";
+    }
+    impl Service<http::Request<Body>> for StalledInfo {
+        type Response = http::Response<Body>;
+        type Error = Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(&mut self, _: &mut TaskContext<'_>) -> Poll<Result<(), Infallible>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, req: http::Request<Body>) -> Self::Future {
+            assert_eq!(req.uri().path(), "/bbs.v2.Bbs/ServerInfo");
+            let send_headers = self.send_headers;
+            Box::pin(async move {
+                if !send_headers {
+                    return std::future::pending().await;
+                }
+                Ok(http::Response::builder()
+                    .header("content-type", "application/grpc")
+                    .body(Body::new(PendingBody))
+                    .unwrap())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_deadline_includes_headers_and_body() {
+        for send_headers in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(
+                tonic::transport::Server::builder()
+                    .add_service(StalledInfo { send_headers })
+                    .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+            );
+            let remote = Remote::connect(&address.to_string(), Caller::default())
+                .await
+                .unwrap();
+            let mut backend = Backend::Remote(remote);
+            let result = tokio::time::timeout(Duration::from_secs(4), backend.server_info()).await;
+            server.abort();
+            let error = result
+                .expect("discovery deadline must include a stalled response body")
+                .unwrap_err();
+            let code = error.downcast_ref::<tonic::Status>().unwrap().code();
+            // Tonic may expire the transmitted grpc-timeout first while waiting for headers.
+            assert!(
+                matches!(code, tonic::Code::DeadlineExceeded | tonic::Code::Cancelled),
+                "{error:#}"
+            );
         }
     }
 }

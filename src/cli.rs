@@ -100,6 +100,12 @@ pub enum Command {
         /// Require authenticated human accounts and strong, owned agent credentials.
         #[arg(long)]
         require_human_token: bool,
+        /// Reject application calls from older clients (SemVer; protocol checks always apply).
+        #[arg(long)]
+        minimum_client_version: Option<semver::Version>,
+        /// Advertise an available client release without requiring it (SemVer).
+        #[arg(long)]
+        recommended_client_version: Option<semver::Version>,
     },
     /// Administer the local server state; ignores client server configuration.
     Admin {
