@@ -9,12 +9,15 @@ listeners must not be restarted by an updater.
 
 ## Current implementation
 
-`Cargo.toml` declares version `0.1.0`, and Clap prints that package version.
-`build.rs` generates protobuf code but embeds no revision or release information;
-`ServerInfo` reports the build revision as `unknown` unless the build sets
-`BBS_BUILD_REVISION`, which current builds do not. There is no CLI release catalog,
-update command, or `bbs version --json`. The image publication workflow is
-separate from CLI installation.
+`Cargo.toml` declares version `0.2.0` and `rust-version`, which CI tests.
+`build.rs` embeds the full git revision, a dirty flag, and the target, or takes
+`BBS_BUILD_REVISION`/`BBS_BUILD_DIRTY` from builders without `.git`; otherwise the
+revision is `unknown`. Side-effect-free `bbs version --json` reports the package
+version, revision, dirty flag, provenance (`clean`, `dirty`, or `unknown`), target,
+protocol epoch and capabilities, schema version, and client config format.
+`ServerInfo` reports the same release information. There is no CLI release
+catalog or update command. The image publication workflow is separate from CLI
+installation.
 
 The wire service is `bbs.v2` with protocol epoch `2`. Every request except
 `ServerInfo` and health carries `bbs-client-version`, `bbs-protocol-epoch`, and,

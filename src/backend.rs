@@ -625,7 +625,7 @@ mod tests {
         for ((path, headers), (method, capabilities)) in observed.iter().zip(expected) {
             assert_eq!(path, &format!("/bbs.v2.Bbs/{method}"));
             assert_eq!(headers["bbs-protocol-epoch"], "2");
-            assert_eq!(headers["bbs-client-version"], env!("CARGO_PKG_VERSION"));
+            assert_eq!(headers["bbs-client-version"], crate::release::VERSION);
             assert_eq!(
                 headers
                     .get("bbs-required-capabilities")

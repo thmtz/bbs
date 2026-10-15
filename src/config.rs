@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::home_dir;
 
+/// Version of the fields `Config` accepts. Increase it when a change means an
+/// older binary can no longer read a config this one writes.
+pub const FORMAT: u32 = 1;
+
 #[derive(Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
