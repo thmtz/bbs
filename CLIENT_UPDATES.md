@@ -15,9 +15,13 @@ listeners must not be restarted by an updater.
 revision is `unknown`. Side-effect-free `bbs version --json` reports the package
 version, revision, dirty flag, provenance (`clean`, `dirty`, or `unknown`), target,
 protocol epoch and capabilities, schema version, and client config format.
-`ServerInfo` reports the same release information. There is no CLI release
-catalog or update command. The image publication workflow is separate from CLI
-installation.
+`ServerInfo` reports the same release information. Published GitHub releases
+tagged `v<version>` form the CLI release catalog: the manually run
+`Publish release` workflow writes `bbs-release.json` with `bbs version --manifest`
+(format, version, tag, revision, minimum Rust version, protocol, schema version,
+config format; integration compatibility is not yet recorded) and refuses a
+version that is already tagged or released. There is no update command. The image
+publication workflow is separate from CLI installation.
 
 The wire service is `bbs.v2` with protocol epoch `2`. Every request except
 `ServerInfo` and health carries `bbs-client-version`, `bbs-protocol-epoch`, and,

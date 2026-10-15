@@ -1,0 +1,55 @@
+name: Publish release
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: publish-release
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Test
+        run: cargo test --locked
+      - name: Write manifest
+        run: |
+          cargo build --release --locked
+          target/release/bbs version --manifest > bbs-release.json
+          python3 -c 'import json, os, sys; m = json.load(open("bbs-release.json")); sys.exit(m["revision"] != os.environ["GITHUB_SHA"])'
+          cat bbs-release.json
+      - name: Refuse an existing version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(python3 -c 'import json; print(json.load(open("bbs-release.json"))["tag"])')
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          tagged=$(git ls-remote --tags origin "refs/tags/$tag")
+          releases=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName --jq '.[].tagName')
+          if [ -n "$tagged" ] || grep -qxF "$tag" <<< "$releases"; then
+            echo "::error::$tag is already tagged or released; bump the package version to publish $GITHUB_SHA."
+            exit 1
+          fi
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<NOTES
+          Source revision \`$GITHUB_SHA\`. Install this release's client with:
+
+          \`\`\`sh
+          cargo install --locked --git https://github.com/wbbradley/bbs --rev $GITHUB_SHA --bin bbs
+          \`\`\`
+
+          \`bbs-release.json\` lists its protocol, schema, config format and minimum Rust version.
+          NOTES
+          gh release create "$TAG" bbs-release.json --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "bbs $TAG" --notes-file notes.md
+          echo "Published [$TAG]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG) at \`$GITHUB_SHA\`." >> "$GITHUB_STEP_SUMMARY"
