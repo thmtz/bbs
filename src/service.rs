@@ -357,7 +357,7 @@ pub fn set_status(
 pub fn bye(conn: &mut Connection, caller: &Caller) -> Result<proto::ByeResponse> {
     with_ctx(conn, caller, |ctx| {
         let me = ctx.agent()?;
-        retire(ctx, &me, &me, &format!("{} retired", me.name))?;
+        retire(ctx, &me, &me, &format!("Agent {:?} retired.", me.name))?;
         Ok(proto::ByeResponse { name: me.name })
     })
 }
@@ -372,18 +372,25 @@ pub fn retire_agent(
         let Some(target) = db::live_agent_by_name(ctx.conn, &req.agent)? else {
             bail!("no live agent named {:?}", req.agent);
         };
-        let notice = format!("{} retired {}", me.name, target.name);
+        let notice = format!("Human {:?} retired agent {:?}.", me.name, target.name);
         retire(ctx, &me, &target, &notice)?;
         Ok(proto::ByeResponse { name: target.name })
     })
 }
 
-/// Announce "`notice` and left @group." from `by` to each of `target`'s
-/// groups, then retire `target`. Announce first: retirement drops the
-/// memberships.
+/// Broadcast the retirement sentence and name the affected agent's membership
+/// change in each group. Announce first: retirement drops the memberships.
 fn retire(ctx: &Ctx, by: &db::Principal, target: &db::Principal, notice: &str) -> Result<()> {
     for (gid, group) in db::member_groups(ctx.conn, target.id)? {
-        broadcast(ctx, by, gid, &format!("{notice} and left @{group}."))?;
+        broadcast(
+            ctx,
+            by,
+            gid,
+            &format!(
+                "{notice} Agent {:?} is no longer a member of group @{group}.",
+                target.name
+            ),
+        )?;
     }
     db::retire_agent(ctx.conn, target.id, &ctx.now_s)?;
     tracing::info!(agent = target.name, by = by.name, "agent retired");
@@ -431,7 +438,12 @@ pub fn group_join(
         let gid = require_group(ctx.conn, group)?;
         let joined = db::join_group(ctx.conn, gid, me.id, &ctx.now_s)?;
         if joined {
-            broadcast(ctx, &me, gid, &format!("{} joined @{group}.", me.name))?;
+            broadcast(
+                ctx,
+                &me,
+                gid,
+                &format!("Agent {:?} joined group @{group}.", me.name),
+            )?;
             tracing::info!(agent = me.name, group, "joined group");
         }
         Ok(proto::GroupJoinResponse {
@@ -453,7 +465,12 @@ pub fn group_leave(
         if !db::is_member(ctx.conn, gid, me.id)? {
             bail!("you are not in @{group}");
         }
-        broadcast(ctx, &me, gid, &format!("{} left @{group}.", me.name))?;
+        broadcast(
+            ctx,
+            &me,
+            gid,
+            &format!("Agent {:?} left group @{group}.", me.name),
+        )?;
         db::leave_group(ctx.conn, gid, me.id)?;
         tracing::info!(agent = me.name, group, "left group");
         Ok(proto::GroupResponse {
@@ -478,7 +495,10 @@ pub fn group_remove(
             bail!("{} is not in @{group}", target.name);
         }
         // Notify before removing so the removed agent learns why the group went quiet.
-        let notice = format!("{} removed {} from @{group}.", me.name, target.name);
+        let notice = format!(
+            "Human {:?} removed agent {:?} from group @{group}.",
+            me.name, target.name
+        );
         broadcast(ctx, &me, gid, &notice)?;
         db::leave_group(ctx.conn, gid, target.id)?;
         tracing::info!(
