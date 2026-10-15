@@ -1334,10 +1334,42 @@ fn agents_lists_status_and_scopes_visibility(mode: Mode) {
         "{seen_by_a}"
     );
     assert!(!seen_by_a.contains(&c), "{seen_by_a}");
-    assert!(!seen_by_a.contains("will"), "{seen_by_a}");
+    assert!(
+        seen_by_a
+            .lines()
+            .all(|l| l.split_whitespace().nth(1) != Some("human")),
+        "{seen_by_a}"
+    );
     let seen_by_human = bbs.ok(&["agents"]);
     assert!(seen_by_human.contains(&a) && seen_by_human.contains(&c));
     assert!(seen_by_human.contains("will"));
+
+    // OWNER follows KIND for agent and human callers; `-` when there is none.
+    bbs.ok(&["human", "add", "ada"]);
+    let (d, td) = bbs.register_with(&["--as", "ada", "register"]);
+    bbs.ok(&["--token", &td, "group", "join", "acme"]);
+    bbs.db()
+        .execute(
+            "DELETE FROM agent_owners WHERE agent_id = (SELECT id FROM agents WHERE name = ?1)",
+            [&c],
+        )
+        .unwrap();
+    let owner = |table: &str, name: &str| {
+        let row = table
+            .lines()
+            .find(|line| line.split_whitespace().next() == Some(name))
+            .unwrap_or_else(|| panic!("{name} missing: {table}"));
+        row.split_whitespace().nth(2).unwrap().to_string()
+    };
+    let seen_by_a = bbs.ok(&["--token", &ta, "agents"]);
+    assert_eq!(owner(&seen_by_a, "NAME"), "OWNER");
+    assert_eq!(owner(&seen_by_a, &b), "will");
+    assert_eq!(owner(&seen_by_a, &d), "ada");
+    let seen_by_human = bbs.ok(&["agents"]);
+    assert_eq!(owner(&seen_by_human, &a), "will");
+    assert_eq!(owner(&seen_by_human, &c), "-");
+    assert_eq!(owner(&seen_by_human, &d), "ada");
+    assert_eq!(owner(&seen_by_human, "will"), "-");
 }
 
 fn hook(bbs: &Bbs, event: serde_json::Value) -> Option<serde_json::Value> {

@@ -9,6 +9,11 @@ request that bumps the package version; correct the date if publishing slips.
 
 ## Unreleased
 
+### Added
+
+- `bbs agents` shows an OWNER column naming each agent's human (`-` for human
+  rows and agents without an owner) (#28).
+
 ### Changed
 
 - **Breaking:** Only the `bbs read --wait` listener delivers mail; hooks now just

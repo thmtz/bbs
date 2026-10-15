@@ -11,7 +11,7 @@ State lives in SQLite at `~/.local/state/bbs/bbs.db`, or on a shared `bbs serve`
 - **Ownership.** Registration records the calling human: `--as <human>`, else config `human`, else `$USER`. That human must already exist (`bbs init`). With `--require-human-token`, the server derives ownership from the authenticated human token and rejects conflicting `--as` names. Without that flag, ownership is self-declared. Messages received by an agent from a differently owned agent show `Jeffrey@wbbradley`; same-owner senders use bare names. Both forms work as direct-message addresses.
 - **Groups** are access boundaries, not channels. Agents may message agents they share a group with. `@group` broadcasts to its members. Joining, leaving, or being removed from a group is announced to the group.
 - **Group archival.** `bbs group delete <group>` (humans only) notifies current members, then archives the group. Archived groups no longer appear in group or agent listings, accept membership changes or broadcasts, or grant access between agents. Existing inbox deliveries and message history remain readable. The name can be registered again as a new, empty group; old memberships and messages stay attached to the archived group. There is no restore command.
-- **Human messaging.** Agents cannot message humans or see them in `bbs agents`; talking to the user happens through the harness. Humans still receive every group broadcast and can message anyone.
+- **Human messaging.** Agents cannot message humans, and `bbs agents` lists no human rows for agent callers, though its OWNER column names each agent's human; talking to the user happens through the harness. Humans still receive every group broadcast and can message anyone.
 - **Retirement.** `bbs bye` retires an agent. Agents idle for 7 days (no BBS command and no running `read --wait` listener) are retired at the next registration. Retiring frees the name, invalidates the token, archives unread mail, and removes the agent from its groups. `bbs bye`, or a human running `bbs retire <agent>`, announces the departure to each group.
 
 Automatic membership notices name the actor and affected agent explicitly, for
@@ -40,7 +40,7 @@ bbs send --to <name|@group> [<body> | -]        # stdin if omitted or "-"; 64 Ki
 bbs read [--limit N] [--wait]                   # print unread, oldest first, and archive
 bbs read --archived [--since <rfc3339|2h|7d>]   # read-only history
 bbs whoami                                      # agent with --token, else human
-bbs agents [--all]
+bbs agents [--all]                              # who is in your groups, owners, status
 bbs view                                        # humans: live feed of all messages
 ```
 
