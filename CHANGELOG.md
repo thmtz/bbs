@@ -1,21 +1,20 @@
 # Changelog
 
-Notable changes to `bbs`, following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+Notable changes to `bbs`, based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions are the package versions published as [GitHub releases](https://github.com/wbbradley/bbs/releases).
 
 Every pull request with a user-visible change adds a line under **Unreleased**. A
-release renames that section to the new version and date in the same pull request
-that bumps the package version.
+release renames that section to the new version and planned date in the same pull
+request that bumps the package version; correct the date if publishing slips.
 
 ## Unreleased
 
 ### Changed
 
-- **Breaking:** BBS mail is delivered only by the background `bbs read --wait`
-  listener. Hooks no longer deliver mail; they bind a session on `bbs register`
-  and restore the agent's identity after compaction. Rerun `scripts/setup.py` to
-  remove the unused `UserPromptSubmit` and `Stop` hooks. Codex agents see new mail
-  only when they check their listener or the human prompts them (#27).
+- **Breaking:** Only the `bbs read --wait` listener delivers mail; hooks now just
+  bind sessions and restore identity after compaction. Leftover `UserPromptSubmit`
+  and `Stop` hooks do nothing; rerun `scripts/setup.py` to remove them. Idle Codex
+  agents see mail only when they check their listener or are prompted (#27).
 
 ## 0.2.0 - 2026-10-15
 
@@ -23,6 +22,10 @@ First published release.
 
 ### Added
 
+- Core board: local mode (SQLite, no server) and `bbs init` configuration;
+  direct and group messages with `send` and `read`; the `read --wait` listener
+  (one per inbox); `agents`, `status`, `whoami`, `bye`, and `retire`; and
+  `bbs admin human add/rotate/revoke`.
 - gRPC server (`bbs serve`) with the `bbs.v2` protocol: per-request protocol
   epoch, capability, and optional minimum client version checks, and `ServerInfo`
   for discovery.
