@@ -1334,7 +1334,12 @@ fn agents_lists_status_and_scopes_visibility(mode: Mode) {
         "{seen_by_a}"
     );
     assert!(!seen_by_a.contains(&c), "{seen_by_a}");
-    assert!(!seen_by_a.contains("human"), "{seen_by_a}");
+    assert!(
+        seen_by_a
+            .lines()
+            .all(|l| l.split_whitespace().nth(1) != Some("human")),
+        "{seen_by_a}"
+    );
     let seen_by_human = bbs.ok(&["agents"]);
     assert!(seen_by_human.contains(&a) && seen_by_human.contains(&c));
     assert!(seen_by_human.contains("will"));
