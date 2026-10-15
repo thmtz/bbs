@@ -829,9 +829,14 @@ fn parse_time(field: &str, s: &str) -> Result<String> {
         .with_context(|| format!("invalid {field} {s:?}: expected RFC3339"))
 }
 
+/// Largest feed window or batch a client may request.
+pub const MAX_FEED_WINDOW: u32 = 1000;
+
 /// The most recent `backlog` messages matching the request's filters, oldest
-/// first. Humans only; never archives anything. Unknown names fail loudly
-/// rather than matching nothing.
+/// first; with `after_id`, the oldest `backlog` matching messages after it.
+/// Humans only; never archives anything. Unknown names fail loudly rather than
+/// matching nothing, and so does a window outside 1..=MAX_FEED_WINDOW: clamping
+/// would silently return something other than what was asked for.
 pub fn feed(
     conn: &mut Connection,
     caller: &Caller,
@@ -839,17 +844,35 @@ pub fn feed(
 ) -> Result<proto::FeedSnapshot> {
     with_ctx(conn, caller, |ctx| {
         let me = ctx.human()?;
-        let group = req.group.as_deref().map(group_name);
-        if let Some(group) = group
-            && !db::group_name_exists(ctx.conn, group)?
-        {
-            bail!("no such group @{group}");
+        if !(1..=MAX_FEED_WINDOW).contains(&req.backlog) {
+            bail!(
+                "feed window must be 1 to {MAX_FEED_WINDOW} messages, not {}",
+                req.backlog
+            );
         }
-        if let Some(from) = req.from.as_deref()
-            && !db::sender_name_exists(ctx.conn, from)?
-        {
-            bail!("no agent or human named {from:?}");
-        }
+        let group_ids = req
+            .group
+            .as_deref()
+            .map(group_name)
+            .map(|group| {
+                let ids = db::group_ids_named(ctx.conn, group)?;
+                if ids.is_empty() {
+                    bail!("no such group @{group}");
+                }
+                Ok(ids)
+            })
+            .transpose()?;
+        let senders = req
+            .from
+            .as_deref()
+            .map(|from| {
+                let ids = db::principals_named(ctx.conn, from)?;
+                if ids.is_empty() {
+                    bail!("no agent or human named {from:?}");
+                }
+                Ok(ids)
+            })
+            .transpose()?;
         let from_human = req
             .from_human
             .as_deref()
@@ -875,19 +898,33 @@ pub fn feed(
             bail!("since ({since}) must be earlier than until ({until})");
         }
         let filter = db::FeedFilter {
-            group,
-            from: req.from.as_deref(),
+            group_ids,
+            senders,
             from_human,
             since: since.as_deref(),
             until: until.as_deref(),
             scope: req.mine.then_some(me.id),
+            after_id: req.after_id,
         };
-        let messages = db::recent_messages(ctx.conn, req.backlog, &filter)?
+        let messages = db::feed_messages(ctx.conn, req.backlog, &filter)?
             .into_iter()
             .map(|m| message(m, None))
             .collect();
         Ok(proto::FeedSnapshot { messages })
     })
+}
+
+/// After sending a cursor-mode snapshot, move the cursor past it. Returns
+/// whether the batch was full, so more matching messages may be waiting and
+/// the feed should fetch again before waiting for the next change.
+pub fn advance_feed_cursor(req: &mut proto::FeedRequest, sent: &proto::FeedSnapshot) -> bool {
+    let Some(after) = &mut req.after_id else {
+        return false;
+    };
+    if let Some(last) = sent.messages.last() {
+        *after = last.id;
+    }
+    sent.messages.len() >= req.backlog as usize
 }
 
 // ---- harness sessions ------------------------------------------------------

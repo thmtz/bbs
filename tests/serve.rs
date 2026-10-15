@@ -648,6 +648,68 @@ async fn feed_filters_are_advertised_and_applied_server_side() {
         .unwrap();
     let bodies: Vec<_> = first.messages.iter().map(|m| m.body.as_str()).collect();
     assert_eq!(bodies, ["two", "three"]);
+
+    // The window is bounded on the server, whatever a client asks for.
+    for backlog in [0, 1001, u32::MAX] {
+        let err = client
+            .watch_feed(as_human(
+                "will",
+                proto::FeedRequest {
+                    backlog,
+                    ..Default::default()
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message().contains(&format!(
+                "feed window must be 1 to 1000 messages, not {backlog}"
+            )),
+            "{err}"
+        );
+    }
+
+    // Cursor mode: oldest first after the cursor, in batches, then live.
+    let mut tail = client
+        .watch_feed(as_human(
+            "will",
+            proto::FeedRequest {
+                backlog: 2,
+                after_id: Some(first.messages[0].id - 2),
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut bodies = Vec::new();
+    while bodies.len() < 3 {
+        let batch = tokio::time::timeout(Duration::from_secs(5), tail.message())
+            .await
+            .expect("cursor batch")
+            .unwrap()
+            .unwrap();
+        assert!(!batch.messages.is_empty() && batch.messages.len() <= 2);
+        bodies.extend(batch.messages.into_iter().map(|m| m.body));
+    }
+    assert_eq!(bodies, ["one", "two", "three"]);
+    client
+        .send(as_human(
+            "will",
+            proto::SendRequest {
+                to: a.name.clone(),
+                body: "four".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    let batch = tokio::time::timeout(Duration::from_secs(5), tail.message())
+        .await
+        .expect("live batch")
+        .unwrap()
+        .unwrap();
+    assert_eq!(batch.messages.len(), 1);
+    assert_eq!(batch.messages[0].body, "four");
 }
 
 /// A server from before `feed-filter.v1`: it enforces required capabilities
@@ -677,6 +739,7 @@ impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>> f
             "owner-attribution.v1",
             "human-token-sessions.v1",
             "group-archive.v1",
+            "group-description.v1",
         ];
         let required = req
             .headers()
@@ -729,7 +792,9 @@ async fn filtered_view_refuses_a_server_without_feed_filter() {
         })
     };
     for args in [
-        &["--json", "--group", "acme"][..],
+        // Following JSON reads by cursor, which an older server would ignore.
+        &["--json"][..],
+        &["--json", "--group", "acme"],
         &["--no-follow", "--from", "@will"],
         &["--json", "--mine"],
         &["--json", "--since", "2h"],
@@ -753,13 +818,13 @@ async fn filtered_view_refuses_a_server_without_feed_filter() {
     server.abort();
     let _ = std::fs::remove_dir_all(&home);
     let seen = seen.lock().unwrap();
-    assert_eq!(seen.len(), 6, "one request per run, no retry or fallback");
+    assert_eq!(seen.len(), 7, "one request per run, no retry or fallback");
     assert!(
-        seen[..5]
+        seen[..6]
             .iter()
             .all(|r| r.as_deref() == Some("owner-attribution.v1,feed-filter.v1"))
     );
-    assert_eq!(seen[5].as_deref(), Some("owner-attribution.v1"));
+    assert_eq!(seen[6].as_deref(), Some("owner-attribution.v1"));
 }
 
 #[tokio::test]

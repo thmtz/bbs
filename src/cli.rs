@@ -171,7 +171,7 @@ pub struct ViewArgs {
     #[arg(long)]
     pub until: Option<String>,
     /// Size of the history window: the most recent N matching messages (default 200).
-    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=crate::backend::MAX_FEED_WINDOW as i64))]
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=crate::service::MAX_FEED_WINDOW as i64))]
     pub limit: Option<u32>,
     /// Print the matching history and exit instead of following new messages.
     #[arg(long)]

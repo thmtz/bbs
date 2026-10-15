@@ -155,9 +155,13 @@ fn schema_version(conn: &Connection) -> Result<usize> {
 /// Bring the schema up to date. Every command calls this on open; concurrent
 /// callers serialize on the write lock and re-check the version under it.
 pub fn migrate(conn: &mut Connection) -> Result<()> {
-    if schema_version(conn)? == MIGRATIONS.len() {
-        return Ok(());
+    if schema_version(conn)? != MIGRATIONS.len() {
+        apply_migrations(conn)?;
     }
+    ensure_indexes(conn)
+}
+
+fn apply_migrations(conn: &mut Connection) -> Result<()> {
     if !conn.is_autocommit() {
         bail!("BBS migrations require a connection without an active transaction");
     }
@@ -807,14 +811,14 @@ pub fn session_agent(
 
 // ---- feed (bbs view) -------------------------------------------------------
 
-/// Feed filters; each set field narrows the window. Names are resolved by the
-/// caller, so unknown names fail before this runs.
+/// Feed filters, with names already resolved to ids; each set field narrows
+/// the result. Only the filters present reach the SQL, so each can use an index.
 #[derive(Debug, Default)]
 pub struct FeedFilter<'a> {
-    /// Broadcasts to any group, active or archived, with this name.
-    pub group: Option<&'a str>,
-    /// Sent by any human or agent, live or retired, with this name.
-    pub from: Option<&'a str>,
+    /// Broadcasts to any of these groups (every group, active or archived, of a name).
+    pub group_ids: Option<Vec<i64>>,
+    /// Sent by any of these principals (every human and agent of a name).
+    pub senders: Option<Vec<(Kind, i64)>>,
     /// Sent by this human id or by an agent it owns.
     pub from_human: Option<i64>,
     /// `created_at >= since`.
@@ -825,33 +829,332 @@ pub struct FeedFilter<'a> {
     /// agents (so group mail counts by membership at send time), or a direct
     /// message to the human itself.
     pub scope: Option<i64>,
+    /// Cursor mode: the oldest matching messages with a greater id, instead of
+    /// the most recent window.
+    pub after_id: Option<i64>,
 }
 
-/// Whether any group, active or archived, ever had this name.
-pub fn group_name_exists(conn: &Connection, name: &str) -> Result<bool> {
+/// Feed lookups. Pure performance: they carry no semantics, so they are
+/// reconciled by name on open (`ensure_indexes`) rather than versioned, and
+/// older binaries can open a board that has them. Changing a definition needs
+/// a new name.
+const FEED_INDEXES: &[(&str, &str)] = &[
+    (
+        "messages_group",
+        "CREATE INDEX IF NOT EXISTS messages_group ON messages (to_group_id, id)",
+    ),
+    (
+        "messages_sender",
+        "CREATE INDEX IF NOT EXISTS messages_sender ON messages (from_kind, from_id, id)",
+    ),
+    (
+        "messages_created",
+        "CREATE INDEX IF NOT EXISTS messages_created ON messages (created_at, id)",
+    ),
+    (
+        "messages_human_dm",
+        "CREATE INDEX IF NOT EXISTS messages_human_dm ON messages (id)
+         WHERE to_group_id IS NULL AND from_kind = 'human'",
+    ),
+    (
+        "deliveries_recipient",
+        "CREATE INDEX IF NOT EXISTS deliveries_recipient
+         ON deliveries (recipient_kind, recipient_id, message_id)",
+    ),
+];
+
+/// Create any missing feed index. Reads first, so an up-to-date board takes no
+/// write lock; concurrent openers serialize on the immediate transaction.
+fn ensure_indexes(conn: &mut Connection) -> Result<()> {
+    let present = |conn: &Connection, name: &str| -> Result<bool> {
+        Ok(conn
+            .prepare("SELECT 1 FROM sqlite_schema WHERE type = 'index' AND name = ?1")?
+            .exists(params![name])?)
+    };
+    let mut missing = false;
+    for (name, _) in FEED_INDEXES {
+        missing |= !present(conn, name)?;
+    }
+    if !missing {
+        return Ok(());
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for (name, sql) in FEED_INDEXES {
+        tx.execute_batch(sql)
+            .with_context(|| format!("creating index {name}"))?;
+    }
+    tx.commit()?;
+    tracing::info!("created feed indexes");
+    Ok(())
+}
+
+/// Ids of every group, active or archived, with this name.
+pub fn group_ids_named(conn: &Connection, name: &str) -> Result<Vec<i64>> {
     Ok(conn
-        .prepare("SELECT 1 FROM bbs_groups WHERE name = ?1")?
-        .exists(params![name])?)
+        .prepare("SELECT id FROM bbs_groups WHERE name = ?1")?
+        .query_map(params![name], |r| r.get(0))?
+        .collect::<Result<_, _>>()?)
 }
 
-/// Whether any human or agent, live or retired, has this name.
-pub fn sender_name_exists(conn: &Connection, name: &str) -> Result<bool> {
+/// Every human and agent, live or retired, with this name, ignoring case.
+pub fn principals_named(conn: &Connection, name: &str) -> Result<Vec<(Kind, i64)>> {
+    let mut out = Vec::new();
+    for (kind, sql) in [
+        (
+            Kind::Human,
+            "SELECT id FROM humans WHERE lower(name) = lower(?1)",
+        ),
+        (
+            Kind::Agent,
+            "SELECT id FROM agents WHERE lower(name) = lower(?1)",
+        ),
+    ] {
+        let ids = conn
+            .prepare(sql)?
+            .query_map(params![name], |r| r.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        out.extend(ids.into_iter().map(|id| (kind, id)));
+    }
+    Ok(out)
+}
+
+/// Every agent, live or retired, this human owns.
+fn owned_agents(conn: &Connection, human: i64) -> Result<Vec<i64>> {
     Ok(conn
-        .prepare(
-            "SELECT 1 FROM humans WHERE lower(name) = lower(?1)
-             UNION ALL SELECT 1 FROM agents WHERE lower(name) = lower(?1)",
-        )?
-        .exists(params![name])?)
+        .prepare_cached("SELECT agent_id FROM agent_owners WHERE human_id = ?1")?
+        .query_map(params![human], |r| r.get(0))?
+        .collect::<Result<_, _>>()?)
 }
 
-/// The most recent `limit` messages matching `filter`, oldest first. Each
+type Args = Vec<rusqlite::types::Value>;
+
+/// One way a message can match an any-of filter, walked through its own index
+/// in id order so a dense match stops after `limit` rows and a sparse one never
+/// scans unrelated messages.
+#[derive(Debug, Clone, Copy)]
+enum Term {
+    /// Sent by this principal.
+    Sent(Kind, i64),
+    /// Delivered to this agent.
+    DeliveredTo(i64),
+    /// A direct message to this human. Agents cannot message humans, so only
+    /// human-sent direct messages qualify.
+    DirectTo(i64),
+}
+
+/// Which any-of filter is expanded into terms; the others stay predicates.
+#[derive(Clone, Copy, PartialEq)]
+enum Expanded {
+    None,
+    Senders,
+    FromHuman,
+    Scope,
+}
+
+const OWNED_AGENTS: &str = "SELECT agent_id FROM agent_owners WHERE human_id = ?";
+
+/// `AND`-joined predicates for every filter except the expanded one.
+fn feed_predicates(filter: &FeedFilter, expanded: Expanded) -> (String, Args) {
+    use rusqlite::types::Value;
+    let mut clauses: Vec<String> = Vec::new();
+    let mut args: Args = Vec::new();
+    let list = |args: &mut Args, ids: &mut dyn Iterator<Item = i64>| -> String {
+        let n = args.len();
+        args.extend(ids.map(Value::Integer));
+        vec!["?"; args.len() - n].join(", ")
+    };
+    if let Some(ids) = &filter.group_ids {
+        clauses.push(format!(
+            "m.to_group_id IN ({})",
+            list(&mut args, &mut ids.iter().copied())
+        ));
+    }
+    if let Some(senders) = filter
+        .senders
+        .as_ref()
+        .filter(|_| expanded != Expanded::Senders)
+    {
+        let mut any = vec!["0".to_string()];
+        for kind in [Kind::Human, Kind::Agent] {
+            let mut ids = senders
+                .iter()
+                .filter(|s| s.0 == kind)
+                .map(|s| s.1)
+                .peekable();
+            if ids.peek().is_some() {
+                any.push(format!(
+                    "(m.from_kind = '{}' AND m.from_id IN ({}))",
+                    kind.as_str(),
+                    list(&mut args, &mut ids)
+                ));
+            }
+        }
+        clauses.push(format!("({})", any.join(" OR ")));
+    }
+    if let Some(human) = filter
+        .from_human
+        .filter(|_| expanded != Expanded::FromHuman)
+    {
+        clauses.push(format!(
+            "((m.from_kind = 'human' AND m.from_id = ?)
+              OR (m.from_kind = 'agent' AND m.from_id IN ({OWNED_AGENTS})))"
+        ));
+        args.extend([human; 2].map(Value::Integer));
+    }
+    if let Some(human) = filter.scope.filter(|_| expanded != Expanded::Scope) {
+        clauses.push(format!(
+            "((m.from_kind = 'human' AND m.from_id = ?)
+              OR (m.from_kind = 'agent' AND m.from_id IN ({OWNED_AGENTS}))
+              OR m.id IN (SELECT message_id FROM deliveries
+                          WHERE recipient_kind = 'agent' AND recipient_id IN ({OWNED_AGENTS}))
+              OR (m.to_group_id IS NULL AND m.from_kind = 'human'
+                  AND m.id IN (SELECT message_id FROM deliveries
+                               WHERE recipient_kind = 'human' AND recipient_id = ?)))"
+        ));
+        args.extend([human; 4].map(Value::Integer));
+    }
+    if let Some(since) = filter.since {
+        clauses.push("m.created_at >= ?".into());
+        args.push(Value::Text(since.into()));
+    }
+    if let Some(until) = filter.until {
+        clauses.push("m.created_at < ?".into());
+        args.push(Value::Text(until.into()));
+    }
+    if let Some(after) = filter.after_id {
+        clauses.push("m.id > ?".into());
+        args.push(Value::Integer(after));
+    }
+    let mut sql = String::new();
+    for clause in clauses {
+        sql.push_str(" AND ");
+        sql.push_str(&clause);
+    }
+    (sql, args)
+}
+
+fn direction(filter: &FeedFilter) -> &'static str {
+    if filter.after_id.is_some() {
+        "ASC"
+    } else {
+        "DESC"
+    }
+}
+
+/// The page of ids for a filter with no any-of term: one indexed walk.
+fn page_sql(limit: u32, filter: &FeedFilter) -> (String, Args) {
+    let (predicates, mut args) = feed_predicates(filter, Expanded::None);
+    let dir = direction(filter);
+    // A window bounded only by time walks the time index from its newest end
+    // and stops after `limit` rows; ordering by id instead would scan every
+    // newer message outside the range. Ids and send times rise together (both
+    // are assigned under the write lock), so the window is the same.
+    let time_only = (filter.since.is_some() || filter.until.is_some())
+        && filter.group_ids.is_none()
+        && filter.after_id.is_none();
+    let order = if time_only {
+        format!("m.created_at {dir}, m.id {dir}")
+    } else {
+        format!("m.id {dir}")
+    };
+    args.push(rusqlite::types::Value::Integer(limit.into()));
+    (
+        format!("SELECT m.id FROM messages m WHERE 1{predicates} ORDER BY {order} LIMIT ?"),
+        args,
+    )
+}
+
+/// The first `limit` ids, in feed order, matching one term and the predicates.
+fn term_sql(term: Term, limit: u32, filter: &FeedFilter, expanded: Expanded) -> (String, Args) {
+    use rusqlite::types::Value;
+    let (predicates, rest) = feed_predicates(filter, expanded);
+    let dir = direction(filter);
+    let (sql, mut args) = match term {
+        Term::Sent(kind, id) => (
+            format!(
+                "SELECT m.id FROM messages m WHERE m.from_kind = ? AND m.from_id = ?{predicates}
+                 ORDER BY m.id {dir} LIMIT ?"
+            ),
+            vec![Value::Text(kind.as_str().into()), Value::Integer(id)],
+        ),
+        Term::DeliveredTo(agent) => (
+            format!(
+                "SELECT m.id FROM deliveries d JOIN messages m ON m.id = d.message_id
+                 WHERE d.recipient_kind = 'agent' AND d.recipient_id = ?{predicates}
+                 ORDER BY d.message_id {dir} LIMIT ?"
+            ),
+            vec![Value::Integer(agent)],
+        ),
+        Term::DirectTo(human) => (
+            format!(
+                "SELECT m.id FROM messages m INDEXED BY messages_human_dm
+                 WHERE m.to_group_id IS NULL AND m.from_kind = 'human'
+                   AND EXISTS (SELECT 1 FROM deliveries x WHERE x.message_id = m.id
+                               AND x.recipient_kind = 'human' AND x.recipient_id = ?){predicates}
+                 ORDER BY m.id {dir} LIMIT ?"
+            ),
+            vec![Value::Integer(human)],
+        ),
+    };
+    args.extend(rest);
+    args.push(Value::Integer(limit.into()));
+    (sql, args)
+}
+
+/// The ids of the page: the first `limit` matches in feed order. An any-of
+/// filter is answered as the union of each term's own first `limit`, which
+/// holds the overall first `limit`.
+fn page_ids(conn: &Connection, limit: u32, filter: &FeedFilter) -> Result<Vec<i64>> {
+    let (expanded, terms) = if let Some(senders) = &filter.senders {
+        let terms = senders.iter().map(|&(k, id)| Term::Sent(k, id)).collect();
+        (Expanded::Senders, terms)
+    } else if let Some(human) = filter.from_human {
+        let mut terms = vec![Term::Sent(Kind::Human, human)];
+        let agents = owned_agents(conn, human)?;
+        terms.extend(agents.into_iter().map(|a| Term::Sent(Kind::Agent, a)));
+        (Expanded::FromHuman, terms)
+    } else if let Some(human) = filter.scope {
+        let mut terms = vec![Term::Sent(Kind::Human, human), Term::DirectTo(human)];
+        for agent in owned_agents(conn, human)? {
+            terms.extend([Term::Sent(Kind::Agent, agent), Term::DeliveredTo(agent)]);
+        }
+        (Expanded::Scope, terms)
+    } else {
+        let (sql, args) = page_sql(limit, filter);
+        return Ok(conn
+            .prepare_cached(&sql)?
+            .query_map(rusqlite::params_from_iter(args), |r| r.get(0))?
+            .collect::<Result<_, _>>()?);
+    };
+    let mut ids = std::collections::BTreeSet::new();
+    for term in terms {
+        let (sql, args) = term_sql(term, limit, filter, expanded);
+        let mut stmt = conn.prepare_cached(&sql)?;
+        for id in stmt.query_map(rusqlite::params_from_iter(args), |r| r.get::<_, i64>(0))? {
+            ids.insert(id?);
+        }
+    }
+    let limit = limit as usize;
+    Ok(if filter.after_id.is_some() {
+        ids.into_iter().take(limit).collect()
+    } else {
+        ids.into_iter().rev().take(limit).collect()
+    })
+}
+
+/// Messages matching `filter`, oldest first, at most `limit`: the most recent
+/// ones, or in cursor mode (`after_id`) the oldest after the cursor. Each
 /// broadcast appears once, regardless of how many deliveries it fanned out to.
-pub fn recent_messages(
+pub fn feed_messages(
     conn: &Connection,
     limit: u32,
     filter: &FeedFilter,
 ) -> Result<Vec<MessageView>> {
-    let mut stmt = conn.prepare(
+    let ids = page_ids(conn, limit, filter)?;
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
         "SELECT m.id, m.created_at, m.from_kind, COALESCE(fa.name, fh.name), g.name,
                 COALESCE(ta.name, th.name), d.archived_at, m.body, owner.name
          FROM messages m
@@ -863,31 +1166,13 @@ pub fn recent_messages(
          LEFT JOIN deliveries d ON m.to_group_id IS NULL AND d.message_id = m.id
          LEFT JOIN agents ta ON d.recipient_kind = 'agent' AND ta.id = d.recipient_id
          LEFT JOIN humans th ON d.recipient_kind = 'human' AND th.id = d.recipient_id
-         WHERE (?2 IS NULL OR g.name = ?2)
-           AND (?3 IS NULL OR lower(COALESCE(fa.name, fh.name)) = lower(?3))
-           AND (?4 IS NULL OR fh.id = ?4 OR sender.human_id = ?4)
-           AND (?5 IS NULL OR m.created_at >= ?5)
-           AND (?6 IS NULL OR m.created_at < ?6)
-           AND (?7 IS NULL OR fh.id = ?7 OR sender.human_id = ?7
-                OR (d.recipient_kind = 'human' AND d.recipient_id = ?7)
-                OR EXISTS (SELECT 1 FROM deliveries x
-                           JOIN agent_owners o ON o.agent_id = x.recipient_id
-                           WHERE x.message_id = m.id AND x.recipient_kind = 'agent'
-                             AND o.human_id = ?7))
-         ORDER BY m.id DESC
-         LIMIT ?1",
-    )?;
-    let params = params![
-        limit,
-        filter.group,
-        filter.from,
-        filter.from_human,
-        filter.since,
-        filter.until,
-        filter.scope,
-    ];
-    let mut rows: Vec<MessageView> = stmt
-        .query_map(params, |r| {
+         WHERE m.id IN ({})
+         ORDER BY m.id",
+        vec!["?"; ids.len()].join(", ")
+    );
+    let rows = conn
+        .prepare(&sql)?
+        .query_map(rusqlite::params_from_iter(ids), |r| {
             let from_kind: String = r.get(2)?;
             Ok(MessageView {
                 id: r.get(0)?,
@@ -907,7 +1192,6 @@ pub fn recent_messages(
             })
         })?
         .collect::<Result<_, _>>()?;
-    rows.reverse();
     Ok(rows)
 }
 
@@ -962,7 +1246,7 @@ mod tests {
         assert!(agent_groups(&conn).unwrap().is_empty());
         assert!(list_groups(&conn, None).unwrap().is_empty());
         assert!(list_groups(&conn, Some(1)).unwrap().is_empty());
-        let feed = recent_messages(&conn, 10, &FeedFilter::default()).unwrap();
+        let feed = feed_messages(&conn, 10, &FeedFilter::default()).unwrap();
         assert_eq!(feed.len(), 1);
         assert_eq!(feed[0].to_group.as_deref(), Some("acme"));
         assert_eq!(feed[0].body, "old message");
@@ -1094,6 +1378,81 @@ mod tests {
     }
 
     #[test]
+    fn feed_filters_use_indexes_not_a_message_scan() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        let plan = |(sql, args): (String, Args)| -> Vec<String> {
+            conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(rusqlite::params_from_iter(args), |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let group = FeedFilter {
+            group_ids: Some(vec![1]),
+            ..Default::default()
+        };
+        let group_cursor = FeedFilter {
+            group_ids: Some(vec![1]),
+            after_id: Some(10),
+            ..Default::default()
+        };
+        let until = FeedFilter {
+            until: Some("2026-01-01T00:00:00.000000Z"),
+            ..Default::default()
+        };
+        let mine = FeedFilter {
+            scope: Some(1),
+            since: Some("2026-01-01T00:00:00.000000Z"),
+            ..Default::default()
+        };
+        let cases = [
+            (page_sql(200, &group), "messages_group"),
+            (page_sql(200, &group_cursor), "messages_group"),
+            (page_sql(200, &until), "messages_created"),
+            (
+                term_sql(Term::Sent(Kind::Agent, 2), 200, &mine, Expanded::Scope),
+                "messages_sender",
+            ),
+            (
+                term_sql(Term::DeliveredTo(2), 200, &mine, Expanded::Scope),
+                "deliveries_recipient",
+            ),
+            (
+                term_sql(Term::DirectTo(1), 200, &mine, Expanded::Scope),
+                "messages_human_dm",
+            ),
+        ];
+        for (sql, index) in cases {
+            let plan = plan(sql);
+            assert!(!plan.iter().any(|l| l == "SCAN m"), "{index}: {plan:?}");
+            assert!(plan.iter().any(|l| l.contains(index)), "{index}: {plan:?}");
+        }
+        // Reopening an up-to-date board leaves the indexes alone.
+        migrate(&mut conn).unwrap();
+    }
+
+    #[test]
+    fn feed_indexes_are_added_to_existing_boards() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        conn.execute_batch("DROP INDEX messages_group; DROP INDEX messages_sender;")
+            .unwrap();
+        migrate(&mut conn).unwrap();
+        for (name, _) in FEED_INDEXES {
+            assert!(
+                conn.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'index' AND name = ?1")
+                    .unwrap()
+                    .exists([name])
+                    .unwrap(),
+                "{name}"
+            );
+        }
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
     fn feed_shows_broadcasts_once_and_dm_read_times() {
         let mut conn = Connection::open_in_memory().unwrap();
         migrate(&mut conn).unwrap();
@@ -1133,7 +1492,7 @@ mod tests {
         let m = insert_message(&conn, &will, None, "hi Bram", t).unwrap();
         insert_delivery(&conn, m, Kind::Agent, b.id).unwrap();
 
-        let feed = recent_messages(&conn, 10, &FeedFilter::default()).unwrap();
+        let feed = feed_messages(&conn, 10, &FeedFilter::default()).unwrap();
         assert_eq!(feed.len(), 2);
         assert_eq!(
             (feed[0].to_group.as_deref(), feed[0].to_name.as_deref()),
@@ -1145,7 +1504,7 @@ mod tests {
         assert_eq!(feed[1].read_at, None);
 
         take_unread(&conn, &b, None, None, "2026-10-09T01:00:00.000000Z").unwrap();
-        let feed = recent_messages(&conn, 10, &FeedFilter::default()).unwrap();
+        let feed = feed_messages(&conn, 10, &FeedFilter::default()).unwrap();
         assert_eq!(feed[0].read_at, None, "broadcast read times stay hidden");
         assert_eq!(
             feed[1].read_at.as_deref(),

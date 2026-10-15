@@ -29,13 +29,13 @@ pub async fn run(backend: &mut Backend, args: ViewArgs) -> Result<()> {
         bail!("bbs view needs a terminal; use --json or --no-follow for plain output");
     }
     let req = request(&args, Utc::now())?;
-    let window = req.backlog;
-    let mut feed = backend.watch_feed(req).await?;
+    let follow_json = args.json && !args.no_follow;
+    if args.json {
+        return stream_json(backend, req, follow_json).await;
+    }
+    let mut feed = backend.watch_feed(req, false).await?;
     // Fetch before taking over the terminal, so a refusal prints normally.
     let rows = feed.next().await?;
-    if args.json {
-        return stream_json(&mut feed, rows, window, !args.no_follow).await;
-    }
     if args.no_follow {
         write_out(&format_feed(&rows))?;
         return Ok(());
@@ -70,6 +70,7 @@ fn request(args: &ViewArgs, now: DateTime<Utc>) -> Result<FeedRequest> {
         since: time("--since", &args.since)?,
         until: time("--until", &args.until)?,
         mine: args.mine,
+        after_id: None,
     })
 }
 
@@ -83,38 +84,49 @@ fn write_out(text: &str) -> Result<bool> {
     }
 }
 
-/// Emit each message once as JSONL. Every snapshot re-sends the whole window,
-/// so only ids above the highest already emitted are new. A full window made
-/// entirely of new messages may have pushed others out unseen; fail rather
-/// than silently skip them.
-async fn stream_json(
-    feed: &mut FeedWatch<'_>,
-    mut rows: Vec<Message>,
-    window: u32,
-    follow: bool,
-) -> Result<()> {
-    let mut last = None::<i64>;
+/// Emit the matching history as JSONL, then, when following, every newer
+/// matching message exactly once. Following reads by cursor (`after_id`), not
+/// by diffing snapshots, so bursts larger than the window are never skipped.
+/// The history request already requires `feed-filter.v1` when following, so an
+/// older server refuses before anything is printed.
+async fn stream_json(backend: &mut Backend, req: FeedRequest, follow: bool) -> Result<()> {
+    let history = backend
+        .watch_feed(req.clone(), follow)
+        .await?
+        .next()
+        .await?;
+    if !write_out(&json_lines(&history)?)? || !follow {
+        return Ok(());
+    }
+    // An empty window means nothing matched yet, so everything after id 0 is new.
+    let mut last = history.last().map_or(0, |m| m.id);
+    let tail = FeedRequest {
+        after_id: Some(last),
+        ..req
+    };
+    let mut feed = backend.watch_feed(tail, true).await?;
     loop {
-        if let (Some(last), Some(first)) = (last, rows.first())
-            && first.id > last
-            && rows.len() >= window as usize
-        {
+        let batch = feed.next().await?;
+        if let Some(m) = batch.iter().find(|m| m.id <= last) {
             bail!(
-                "more than {window} matching messages arrived between feed updates, so some may be missing; rerun with a larger --limit or narrow the filters"
+                "feed cursor went backwards: got message {} after {last}",
+                m.id
             );
         }
-        let mut out = String::new();
-        for m in rows.iter().filter(|m| last.is_none_or(|l| m.id > l)) {
-            out.push_str(&serde_json::to_string(&json(m))?);
-            out.push('\n');
-        }
-        if !write_out(&out)? || !follow {
+        if !write_out(&json_lines(&batch)?)? {
             return Ok(());
         }
-        let newest = rows.iter().map(|m| m.id).max().unwrap_or(0);
-        last = Some(last.map_or(newest, |l| l.max(newest)));
-        rows = feed.next().await?;
+        last = batch.last().map_or(last, |m| m.id);
     }
+}
+
+fn json_lines(rows: &[Message]) -> Result<String> {
+    let mut out = String::new();
+    for m in rows {
+        out.push_str(&serde_json::to_string(&json(m))?);
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 /// One JSONL message: the same shape as `bbs read --json`, plus `read_at`.

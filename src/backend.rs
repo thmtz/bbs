@@ -23,9 +23,8 @@ const WAIT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const FEED_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const WAIT_TOUCH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const GROUP_DESCRIPTION: &str = "group-description.v1";
-/// Largest `bbs view --limit`; with 64 KiB bodies, a full window stays below
-/// FEED_DECODE_LIMIT (tonic's 4 MiB default would reject a large window).
-pub const MAX_FEED_WINDOW: u32 = 1000;
+/// With 64 KiB bodies, a full window of `service::MAX_FEED_WINDOW` messages
+/// stays below this (tonic's 4 MiB default would reject a large window).
 const FEED_DECODE_LIMIT: usize = 80 * 1024 * 1024;
 
 pub enum Backend {
@@ -70,7 +69,6 @@ impl Remote {
             .await
             .with_context(|| format!("connecting to bbs server at {addr}"))?;
         Ok(Remote {
-            // A feed snapshot of MAX_FEED_WINDOW maximal bodies must still decode.
             client: BbsClient::new(channel).max_decoding_message_size(FEED_DECODE_LIMIT),
             caller,
         })
@@ -355,18 +353,27 @@ impl Backend {
     }
 
     /// Watch the most recent `req.backlog` matching messages (humans only): the
-    /// first snapshot comes at once, then one after every change. Any filter
-    /// requires `feed-filter.v1`, since an older server would ignore it.
-    pub async fn watch_feed(&mut self, req: proto::FeedRequest) -> Result<FeedWatch<'_>> {
+    /// first snapshot comes at once, then one after every change. With
+    /// `after_id`, each snapshot is instead the next batch after the cursor.
+    /// Filters and the cursor require `feed-filter.v1`, since an older server
+    /// would ignore them; `require_filter` also requires it for a request that
+    /// sets neither, so a caller about to follow by cursor fails up front.
+    pub async fn watch_feed(
+        &mut self,
+        req: proto::FeedRequest,
+        require_filter: bool,
+    ) -> Result<FeedWatch<'_>> {
         Ok(match self {
             Backend::Local(local) => FeedWatch::Local {
                 local,
                 req,
                 seen: None,
                 next_poll: tokio::time::Instant::now(),
+                drain: false,
+                sent: false,
             },
             Backend::Remote(r) => {
-                let capabilities: &[&str] = if feed_filtered(&req) {
+                let capabilities: &[&str] = if require_filter || feed_filtered(&req) {
                     &["owner-attribution.v1", "feed-filter.v1"]
                 } else {
                     &["owner-attribution.v1"]
@@ -406,19 +413,26 @@ fn feed_filtered(req: &proto::FeedRequest) -> bool {
         || req.since.is_some()
         || req.until.is_some()
         || req.mine
+        || req.after_id.is_some()
 }
 
 pub enum FeedWatch<'a> {
     /// Polls `data_version`, which changes only when another connection
-    /// commits, and re-fetches after a change.
+    /// commits, and re-fetches after a change. In cursor mode it behaves like
+    /// the server: it fetches again at once after a full batch and skips empty
+    /// batches after the first.
     Local {
         local: &'a mut Local,
         req: proto::FeedRequest,
         seen: Option<i64>,
         /// Kept across calls, so a cancelled `next` does not poll early.
         next_poll: tokio::time::Instant,
+        /// The last cursor batch was full: fetch again without waiting.
+        drain: bool,
+        /// A snapshot has been returned.
+        sent: bool,
     },
-    /// The server pushes a snapshot after every change.
+    /// The server pushes a snapshot after every change (or cursor batch).
     Remote(tonic::Streaming<proto::FeedSnapshot>),
 }
 
@@ -431,15 +445,25 @@ impl FeedWatch<'_> {
                 req,
                 seen,
                 next_poll,
+                drain,
+                sent,
             } => loop {
-                tokio::time::sleep_until(*next_poll).await;
-                *next_poll = tokio::time::Instant::now() + FEED_POLL_INTERVAL;
-                let version = db::data_version(&local.conn)?;
-                if *seen != Some(version) {
-                    let snapshot = service::feed(&mut local.conn, &local.caller, req.clone())?;
+                if !*drain {
+                    tokio::time::sleep_until(*next_poll).await;
+                    *next_poll = tokio::time::Instant::now() + FEED_POLL_INTERVAL;
+                    let version = db::data_version(&local.conn)?;
+                    if *seen == Some(version) {
+                        continue;
+                    }
                     *seen = Some(version);
-                    return Ok(snapshot.messages);
                 }
+                let snapshot = service::feed(&mut local.conn, &local.caller, req.clone())?;
+                *drain = service::advance_feed_cursor(req, &snapshot);
+                if req.after_id.is_some() && snapshot.messages.is_empty() && *sent {
+                    continue;
+                }
+                *sent = true;
+                return Ok(snapshot.messages);
             },
             FeedWatch::Remote(stream) => match stream.message().await.map_err(status_error)? {
                 Some(snapshot) => Ok(snapshot.messages),
@@ -642,13 +666,13 @@ mod tests {
             backlog: 10,
             ..Default::default()
         };
-        assert!(backend.watch_feed(unfiltered).await.is_err());
+        assert!(backend.watch_feed(unfiltered, false).await.is_err());
         let filtered = proto::FeedRequest {
             backlog: 10,
             mine: true,
             ..Default::default()
         };
-        assert!(backend.watch_feed(filtered).await.is_err());
+        assert!(backend.watch_feed(filtered, false).await.is_err());
         assert!(
             backend
                 .bind_session(proto::BindSessionRequest::default())

@@ -214,12 +214,26 @@ retirement.
 changes. It does not archive messages. Each snapshot is the most recent
 `backlog` messages matching the request's filters (group, sender name, sending
 human with their agents, time range, and the caller's own scope), evaluated in
-SQL on every refresh. An older server would ignore the filter fields, so the
-client requires `feed-filter.v1` whenever one is set. The caller's scope uses
-delivery rows, so group mail counts by membership at send time. Snapshots
-re-send the whole window; `bbs view --json` emits only ids above the highest it
-has printed, and fails if a refresh brings a full window of new messages, since
-older ones may have been pushed out unseen. Stream cancellation uses a separate
+SQL on every refresh. The server rejects a `backlog` outside 1 to 1000 rather
+than clamping it. An older server would ignore the filter fields, so the client
+requires `feed-filter.v1` whenever one is set. The caller's scope uses delivery
+rows, so group mail counts by membership at send time. Names are resolved to
+ids first and only the filters present reach the SQL. An any-of filter (sender
+name, a human with their agents, the caller's scope) runs one indexed walk per
+principal or delivery recipient, each stopping after `backlog` rows, and merges
+them, so dense and sparse matches both avoid scanning the message table. The
+supporting indexes are reconciled by name whenever a board is opened instead of
+by a numbered migration: they carry no semantics, and older binaries open the
+board unchanged.
+
+Snapshots re-send the whole window, which suits the TUI. A request with
+`after_id` is a cursor instead: each snapshot is the next batch of at most
+`backlog` matching messages after the cursor, oldest first; the server advances
+past each batch it sends, fetches again at once after a full batch, and
+otherwise sends only when a change brings new matches. `bbs view --json` prints
+the history window, then follows from its newest id this way, so bursts larger
+than the window arrive in full and nothing is printed twice. Local mode
+reproduces the same cursor loop over `data_version` polling. Stream cancellation uses a separate
 terminal channel so shutdown or failed credential checks bypass queued
 application data and do not retain a producer behind a full message buffer.
 Already delivered or transport-buffered data cannot be recalled.

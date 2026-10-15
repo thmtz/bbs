@@ -2173,6 +2173,81 @@ fn view_since_and_until_bound_history(mode: Mode) {
     );
 }
 
+/// Lines from a spawned `bbs view --json`, read on a thread.
+fn spawn_lines(child: &mut Child) -> std::sync::mpsc::Receiver<String> {
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { return };
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    rx
+}
+
+fn next_body(rx: &std::sync::mpsc::Receiver<String>) -> String {
+    let line = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("view --json emitted a line");
+    let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+    value["body"].as_str().unwrap().to_string()
+}
+
+/// With `--limit 1`, each new message replaces the whole window; a burst far
+/// larger than the window arrives in one change. Both must print every
+/// message once and keep the stream open.
+fn view_json_follow_survives_full_windows_and_bursts(mode: Mode) {
+    let bbs = Bbs::with_mode("view-burst", mode);
+    let (a, _ta) = bbs.register();
+    bbs.ok(&["send", "--to", &a, "history"]);
+    let mut child = bbs.spawn(&["view", "--json", "--limit", "1", "--from", "will"]);
+    let rx = spawn_lines(&mut child);
+    assert_eq!(next_body(&rx), "history");
+
+    bbs.ok(&["send", "--to", &a, "one"]);
+    assert_eq!(next_body(&rx), "one");
+    bbs.ok(&["send", "--to", &a, "two"]);
+    assert_eq!(next_body(&rx), "two");
+
+    // Commit a burst in one transaction, so a single change brings all of it.
+    let db = bbs.db();
+    let will: i64 = db
+        .query_row("SELECT id FROM humans WHERE name = 'will'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let agent: i64 = db
+        .query_row("SELECT id FROM agents WHERE name = ?1", [&a], |r| r.get(0))
+        .unwrap();
+    let mut sql = String::from("BEGIN;");
+    for i in 0..5 {
+        sql.push_str(&format!(
+            "INSERT INTO messages (from_kind, from_id, body, created_at)
+             VALUES ('human', {will}, 'burst {i}', '2026-10-15T00:00:00.000000Z');
+             INSERT INTO deliveries (message_id, recipient_kind, recipient_id)
+             VALUES (last_insert_rowid(), 'agent', {agent});"
+        ));
+    }
+    sql.push_str("COMMIT;");
+    db.execute_batch(&sql).unwrap();
+    // The server is only notified by its own writes; this send wakes it.
+    bbs.ok(&["send", "--to", &a, "after burst"]);
+    for i in 0..5 {
+        assert_eq!(next_body(&rx), format!("burst {i}"));
+    }
+    assert_eq!(next_body(&rx), "after burst");
+    assert!(child.try_wait().unwrap().is_none(), "stream ended");
+    bbs.ok(&["send", "--to", &a, "still live"]);
+    assert_eq!(next_body(&rx), "still live");
+    let _ = child.kill();
+    let _ = child.wait();
+    let extra: Vec<String> = rx.try_iter().collect();
+    assert!(extra.is_empty(), "duplicate or stray lines: {extra:?}");
+}
+
 fn view_json_follow_emits_each_message_once(mode: Mode) {
     let bbs = Bbs::with_mode("view-follow", mode);
     let (a, ta) = bbs.register();
@@ -2247,4 +2322,5 @@ both_modes!(
     view_filters_by_group_sender_owner_and_scope,
     view_since_and_until_bound_history,
     view_json_follow_emits_each_message_once,
+    view_json_follow_survives_full_windows_and_bursts,
 );

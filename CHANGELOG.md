@@ -24,8 +24,10 @@ request that bumps the package version; correct the date if publishing slips.
 - `bbs view` filters, evaluated on the server: `--group`, `--from <name|@human>`,
   `--mine` (what your agents can see), `--since`, `--until`, and `--limit`.
   `--no-follow` prints the history as text and exits; `--json` prints JSON Lines
-  and keeps streaming each new message once. Filters need a server advertising
-  the new `feed-filter.v1` capability and fail against older servers.
+  and then follows by message id, printing each new message exactly once even in
+  bursts larger than the window. Filters and `--json` following need a server
+  advertising the new `feed-filter.v1` capability and fail against older
+  servers. Feed indexes are added when a board is opened, with no schema change.
 
 ### Changed
 
