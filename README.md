@@ -213,6 +213,19 @@ actual state directory, using `/var/lib/bbs` in the container image. When also
 upgrading the schema, stop the old server and back up before running the new
 binary's administrator commands.
 
+With the server container stopped, run administration in a one-off container
+against its existing volume (substitute the actual volume name and human):
+
+```sh
+docker run --rm -v bbs-state:/var/lib/bbs --entrypoint bbs \
+  ghcr.io/wbbradley/bbs@sha256:a65362947e8773ac4600775faac696c6d07a72e2487ad2b0b84d6fa7d82b1ee8 \
+  admin human rotate Ada --state-dir /var/lib/bbs
+```
+
+For Kubernetes, use a maintenance pod mounting the same PVC while the StatefulSet
+is stopped, as in the [restore procedure](#backup-and-restore), and run the admin
+command there. These commands print a secret token; deliver it privately.
+
 Required-token mode rejects an agent unless its token is strong and its owner
 has an enabled human token. Provisioning the owner's credential preserves an
 existing strong agent token. Agents with short legacy tokens or missing owners
