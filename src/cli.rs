@@ -117,6 +117,12 @@ pub enum Command {
     },
     /// Print the caller's name: the agent owning --token, else the human.
     Whoami,
+    /// Print this build's version, revision, protocol, and schema support.
+    Version {
+        /// Print one JSON object.
+        #[arg(long)]
+        json: bool,
+    },
     /// Back up a local server database, including while it is running.
     Backup {
         /// New backup file to create; existing files are never overwritten.

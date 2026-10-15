@@ -22,6 +22,8 @@ jobs:
           docker build \
             --label org.opencontainers.image.source=https://github.com/wbbradley/bbs \
             --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            --build-arg BBS_BUILD_REVISION="$GITHUB_SHA" \
+            --build-arg BBS_BUILD_DIRTY=false \
             -t "ghcr.io/wbbradley/bbs:git-$GITHUB_SHA" .
       - name: Test restricted container
         run: python3 scripts/test_container.py "ghcr.io/wbbradley/bbs:git-$GITHUB_SHA" --bbs target/debug/bbs

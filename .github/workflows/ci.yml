@@ -16,6 +16,22 @@ jobs:
       - name: Test
         run: cargo test --locked
       - name: Build container
-        run: docker build -t bbs:test .
+        run: docker build --build-arg BBS_BUILD_REVISION="$GITHUB_SHA" --build-arg BBS_BUILD_DIRTY=false -t bbs:test .
       - name: Test restricted container
         run: python3 scripts/test_container.py bbs:test --bbs target/debug/bbs
+      - name: Check container build identity
+        run: |
+          docker run --rm --entrypoint bbs bbs:test version --json > identity.json
+          python3 -c 'import json, os, sys; r = json.load(open("identity.json")); sys.exit(r["revision"] != os.environ["GITHUB_SHA"] or r["provenance"] != "clean")'
+  msrv:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Test minimum supported Rust version
+        run: |
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          rustup toolchain install "$msrv" --profile minimal
+          cargo "+$msrv" test --locked

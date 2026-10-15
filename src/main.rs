@@ -10,6 +10,7 @@ mod hook;
 mod names;
 mod proto;
 mod protocol;
+mod release;
 mod serve;
 mod service;
 mod view;
@@ -45,9 +46,15 @@ fn init_logging() {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    init_logging();
     let cli = cli::Cli::parse();
-    match app::run(cli).await {
+    // Handled before logging, which creates ~/bbs.log, so it has no side effects.
+    let result = if let cli::Command::Version { json } = cli.command {
+        release::print(json)
+    } else {
+        init_logging();
+        app::run(cli).await
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             tracing::error!("{err:#}");

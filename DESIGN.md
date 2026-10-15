@@ -58,15 +58,24 @@ a capability only when the operation depends on it, such as `named-agents.v1`
 for a requested name or `group-archive.v1` for group deletion. Unrequired newer
 capabilities are ignored.
 
-`ServerInfo` is public discovery: release version and build revision (`unknown`
-unless the build sets `BBS_BUILD_REVISION`, which current builds do not), protocol
-epoch, capabilities, whether human tokens are required, and optional minimum and
+`ServerInfo` is public discovery: release version, build revision and dirty
+flag, protocol epoch, capabilities, whether human tokens are required, and optional minimum and
 recommended client versions. Responses, errors, and opened streams also carry
 the server version, epoch, and version policy as metadata. Discovery is
 diagnostic; it never replaces the per-request checks. The recommended version
-is advisory, and the server never installs or restarts clients. Unique release
-identity, discovery of published releases, and client updates are designed in
+is advisory, and the server never installs or restarts clients. Discovery of
+published releases and client updates are designed in
 [CLIENT_UPDATES.md](CLIENT_UPDATES.md) and are not implemented.
+
+[src/release.rs](src/release.rs) is the single source of build identity for
+`ServerInfo` and `bbs version`. `build.rs` embeds the full revision of the
+package's own git checkout and whether tracked files differed from it, or takes
+`BBS_BUILD_REVISION` and `BBS_BUILD_DIRTY` from builders without `.git`; an
+unavailable revision is `unknown` with no dirty flag. Only a clean build of a
+known revision can be an official release; dirty and unknown builds are
+development builds. `bbs version` reads only compiled-in constants and runs
+before logging, configuration, or backend setup, so it creates no files and
+opens no connection.
 
 Caller credentials travel in gRPC metadata:
 

@@ -5,7 +5,7 @@ use semver::Version;
 use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::{Response, Status};
 
-use crate::proto;
+use crate::{proto, release};
 
 pub const EPOCH: u32 = 2;
 pub const CAPABILITIES: &[&str] = &[
@@ -51,13 +51,7 @@ impl Policy {
             require_human_token,
             protocol_epoch: Some(EPOCH),
             capabilities: CAPABILITIES.iter().map(|s| (*s).into()).collect(),
-            release: Some(proto::ReleaseInfo {
-                version: env!("CARGO_PKG_VERSION").into(),
-                revision: option_env!("BBS_BUILD_REVISION")
-                    .unwrap_or("unknown")
-                    .into(),
-                dirty: option_env!("BBS_BUILD_DIRTY").and_then(|v| v.parse().ok()),
-            }),
+            release: Some(release::info()),
             minimum_client_version: self.minimum.as_ref().map(ToString::to_string),
             recommended_client_version: self.recommended.as_ref().map(ToString::to_string),
         }
@@ -66,7 +60,7 @@ impl Policy {
     fn hints(&self, metadata: &mut MetadataMap) {
         metadata.insert(
             "bbs-server-version",
-            MetadataValue::from_static(env!("CARGO_PKG_VERSION")),
+            MetadataValue::from_static(release::VERSION),
         );
         metadata.insert("bbs-protocol-epoch", MetadataValue::from_static("2"));
         if let Some(version) = &self.minimum {
@@ -185,7 +179,7 @@ fn valid_capability(value: &str) -> bool {
 pub fn client_metadata(metadata: &mut MetadataMap, capabilities: &[&str]) {
     metadata.insert(
         "bbs-client-version",
-        MetadataValue::from_static(env!("CARGO_PKG_VERSION")),
+        MetadataValue::from_static(release::VERSION),
     );
     metadata.insert("bbs-protocol-epoch", MetadataValue::from_static("2"));
     if !capabilities.is_empty() {

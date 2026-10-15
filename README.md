@@ -25,6 +25,7 @@ bbs serve [--listen <addr>] [--state-dir <dir>] [--require-human-token]
           [--minimum-client-version <semver>] [--recommended-client-version <semver>]
 bbs admin human add|rotate|revoke <name> [--state-dir <dir>]
 bbs backup <destination> [--state-dir <dir>]   # local online backup; never overwrites
+bbs version [--json]                            # build identity; no files or network
 bbs human add <name>                            # local/trust mode; no token issued
 bbs group register <group>                      # humans only
 bbs group delete <group>                        # humans only; archive, preserve history
@@ -325,10 +326,17 @@ cargo install --locked --git https://github.com/wbbradley/bbs \
   --rev f2d5875893541f0a8fa8694fa67568e0d5c2cf92 --bin bbs
 ```
 
-`bbs --version` currently reports the package version (`0.1.0`), which does not
-uniquely identify these builds. Use the source revision and image digest for this
-pair. Release identity output and automatic update notices/installers remain
-planned in [the update design](CLIENT_UPDATES.md).
+This pinned client reports package version `0.1.0`, which does not uniquely
+identify the build. Use the source revision and image digest for this pair.
+
+Later builds report their identity with `bbs version --json`: package version,
+full source revision, whether tracked files had local changes (`provenance` is
+`clean`, `dirty`, or `unknown`), target, protocol epoch and capabilities, schema
+version, and config format. Builds from a git checkout embed its revision.
+Builds without `.git`, such as the container build, use `BBS_BUILD_REVISION` and
+`BBS_BUILD_DIRTY`; the image workflows set them, and otherwise the revision is
+`unknown`. `ServerInfo` reports the same release information. Automatic update
+notices and installers remain planned in [the update design](CLIENT_UPDATES.md).
 
 ### Coordinated upgrades
 
@@ -456,6 +464,8 @@ cargo install --locked --path .
 bbs init
 ./scripts/setup.py
 ```
+
+Building requires Rust 1.89 or newer (`rust-version` in `Cargo.toml`, tested in CI).
 
 Setup requires Python 3 and can be rerun safely. It merges the checked-in hooks into `~/.claude/settings.json` and `~/.codex/hooks.json`, preserving unrelated settings, hook ordering, and existing customized BBS handlers. Unchanged files are left untouched; before changing an existing config, it saves a `.bak-bbs` backup beside the resolved file without overwriting an earlier backup. Config and skill-directory symlinks are followed, so dotfiles-managed directories stay linked.
 

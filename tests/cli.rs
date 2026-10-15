@@ -193,6 +193,46 @@ fn requires_init() {
     std::fs::remove_dir_all(&home).unwrap();
 }
 
+#[test]
+fn version_reports_identity_without_side_effects() {
+    let home = std::env::temp_dir().join(format!("bbs-test-{}-version", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    for json in [true, false] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bbs"));
+        command.arg("version");
+        if json {
+            command.arg("--json");
+        }
+        // An unreachable server would fail any command that tried to connect.
+        let out = command
+            .env("HOME", &home)
+            .env("BBS_SERVER", "127.0.0.1:1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        if json {
+            let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+            assert_eq!(report["version"], env!("CARGO_PKG_VERSION"));
+            let revision = report["revision"].as_str().unwrap();
+            assert!(revision == "unknown" || revision.len() == 40, "{revision}");
+            assert!(
+                ["clean", "dirty", "unknown"].contains(&report["provenance"].as_str().unwrap())
+            );
+            assert_eq!(report["protocol"]["epoch"], 2);
+            assert!(report["protocol"]["capabilities"].as_array().unwrap().len() >= 4);
+            assert_eq!(report["schema_version"], 6);
+            assert_eq!(report["config_format"], 1);
+            assert!(!report["target"].as_str().unwrap().is_empty());
+        } else {
+            assert!(stdout.starts_with(&format!("bbs {} (", env!("CARGO_PKG_VERSION"))));
+        }
+    }
+    assert_eq!(std::fs::read_dir(&home).unwrap().count(), 0);
+    std::fs::remove_dir_all(&home).unwrap();
+}
+
 fn init_is_idempotent(mode: Mode) {
     let bbs = Bbs::with_mode("reinit", mode);
     bbs.ok(&["group", "register", "acme"]);

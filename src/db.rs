@@ -8,6 +8,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
 
+/// The schema every migrating open advances to.
+pub const SCHEMA_VERSION: usize = MIGRATIONS.len();
+
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_sessions.sql"),
