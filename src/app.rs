@@ -358,9 +358,10 @@ pub(crate) fn format_messages(msgs: &[proto::Message]) -> Result<String> {
 }
 
 fn format_agents(r: &proto::ListAgentsResponse) -> String {
-    let mut table: Vec<[String; 6]> = vec![[
+    let mut table: Vec<[String; 7]> = vec![[
         "NAME".into(),
         "KIND".into(),
+        "OWNER".into(),
         "GROUPS".into(),
         "ACTIVE_AT".into(),
         "WHERE".into(),
@@ -370,6 +371,7 @@ fn format_agents(r: &proto::ListAgentsResponse) -> String {
         table.push([
             h.name.clone(),
             "human".into(),
+            "-".into(),
             "*".into(),
             display_time(&h.active_at),
             String::new(),
@@ -382,6 +384,7 @@ fn format_agents(r: &proto::ListAgentsResponse) -> String {
         table.push([
             a.name.clone(),
             kind.into(),
+            a.owner.clone().unwrap_or_else(|| "-".into()),
             if g.is_empty() { "-".into() } else { g },
             display_time(&a.active_at),
             format!("{}:{}", a.hostname, a.pwd),
@@ -391,7 +394,7 @@ fn format_agents(r: &proto::ListAgentsResponse) -> String {
     render_table(&table)
 }
 
-fn render_table(rows: &[[String; 6]]) -> String {
+fn render_table(rows: &[[String; 7]]) -> String {
     let mut widths: HashMap<usize, usize> = HashMap::new();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
