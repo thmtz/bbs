@@ -177,7 +177,22 @@ pub enum AdminHumanCommand {
 #[derive(Subcommand, Debug)]
 pub enum GroupCommand {
     /// Create a group (humans only).
-    Register { group: String },
+    Register {
+        group: String,
+        /// One line on what the group is for (at most 200 characters).
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Set or clear what a group is for (humans only).
+    Describe {
+        group: String,
+        /// One line on what the group is for (at most 200 characters).
+        #[arg(required_unless_present = "clear")]
+        description: Option<String>,
+        /// Remove the description instead of setting one.
+        #[arg(long, conflicts_with = "description")]
+        clear: bool,
+    },
     /// Archive a group and end its access scope (humans only).
     Delete { group: String },
     /// Join a group (agents only).
@@ -186,7 +201,7 @@ pub enum GroupCommand {
     Leave { group: String },
     /// Remove an agent from a group (humans only).
     Remove { group: String, agent: String },
-    /// List groups and their members.
+    /// List groups, their members, and descriptions.
     List {
         /// Print one JSON object per group (JSONL) instead of text.
         #[arg(long)]

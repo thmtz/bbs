@@ -18,6 +18,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0004_agent_owners.sql"),
     include_str!("../migrations/0005_human_tokens.sql"),
     include_str!("../migrations/0006_group_archive.sql"),
+    include_str!("../migrations/0007_group_description.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +53,13 @@ pub struct AgentRow {
     pub active_at: String,
     pub retired_at: Option<String>,
     pub owner: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct GroupRow {
+    pub name: String,
+    pub description: Option<String>,
+    pub members: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -483,12 +491,30 @@ pub fn group_id(conn: &Connection, name: &str) -> Result<Option<i64>> {
         .optional()?)
 }
 
-pub fn insert_group(conn: &Connection, name: &str, now: &str) -> Result<i64> {
+pub fn insert_group(
+    conn: &Connection,
+    name: &str,
+    description: Option<&str>,
+    now: &str,
+) -> Result<i64> {
     conn.execute(
-        "INSERT INTO bbs_groups (name, created_at) VALUES (?1, ?2)",
-        params![name, now],
+        "INSERT INTO bbs_groups (name, description, created_at) VALUES (?1, ?2, ?3)",
+        params![name, description, now],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Set or, with `None`, clear an active group's description.
+pub fn set_group_description(
+    conn: &Connection,
+    group_id: i64,
+    description: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE bbs_groups SET description = ?1 WHERE id = ?2 AND archived_at IS NULL",
+        params![description, group_id],
+    )?;
+    Ok(())
 }
 
 pub fn archive_group(conn: &Connection, group_id: i64, now: &str) -> Result<()> {
@@ -565,30 +591,41 @@ pub fn member_groups(conn: &Connection, agent_id: i64) -> Result<Vec<(i64, Strin
     Ok(groups)
 }
 
-/// (group name, member names) for every group, or only those `agent_id` belongs to.
-pub fn list_groups(conn: &Connection, agent_id: Option<i64>) -> Result<Vec<(String, Vec<String>)>> {
+/// Every active group with its description and member names, or only those
+/// `agent_id` belongs to.
+pub fn list_groups(conn: &Connection, agent_id: Option<i64>) -> Result<Vec<GroupRow>> {
     let mut stmt = conn.prepare(
-        "SELECT g.name, a.name FROM bbs_groups g
+        "SELECT g.id, g.name, g.description, a.name FROM bbs_groups g
          LEFT JOIN group_members m ON m.group_id = g.id
          LEFT JOIN agents a ON a.id = m.agent_id
          WHERE g.archived_at IS NULL
          AND (?1 IS NULL OR g.id IN (SELECT group_id FROM group_members WHERE agent_id = ?1))
          ORDER BY g.name, lower(a.name)",
     )?;
-    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    let mut groups: Vec<(i64, GroupRow)> = Vec::new();
     let rows = stmt.query_map(params![agent_id], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<String>>(2)?,
+            r.get::<_, Option<String>>(3)?,
+        ))
     })?;
     for row in rows {
-        let (group, member) = row?;
-        if groups.last().is_none_or(|(g, _)| *g != group) {
-            groups.push((group, Vec::new()));
+        let (id, name, description, member) = row?;
+        if groups.last().is_none_or(|(g, _)| *g != id) {
+            let group = GroupRow {
+                name,
+                description,
+                members: Vec::new(),
+            };
+            groups.push((id, group));
         }
         if let Some(member) = member {
-            groups.last_mut().unwrap().1.push(member);
+            groups.last_mut().unwrap().1.members.push(member);
         }
     }
-    Ok(groups)
+    Ok(groups.into_iter().map(|(_, group)| group).collect())
 }
 
 /// Agent id -> names of the groups it belongs to.
@@ -841,11 +878,15 @@ mod tests {
         .unwrap();
         migrate(&mut conn).unwrap();
         migrate(&mut conn).unwrap();
-        assert_eq!(schema_version(&conn).unwrap(), 6);
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
         assert_eq!(group_id(&conn, "acme").unwrap(), Some(1));
         assert_eq!(
             list_groups(&conn, None).unwrap(),
-            vec![("acme".into(), vec!["Aiko".into()])]
+            vec![GroupRow {
+                name: "acme".into(),
+                description: None,
+                members: vec!["Aiko".into()],
+            }]
         );
         assert!(is_member(&conn, 1, 1).unwrap());
         assert_eq!(group_member_ids(&conn, 1).unwrap(), vec![1]);
@@ -888,14 +929,72 @@ mod tests {
             .unwrap();
         assert!(index_sql.contains("CREATE UNIQUE INDEX"));
         assert!(index_sql.contains("WHERE archived_at IS NULL"));
-        let new_id = insert_group(&conn, "acme", "2026-10-15").unwrap();
+        let new_id = insert_group(&conn, "acme", None, "2026-10-15").unwrap();
         assert_ne!(new_id, 1);
         assert!(group_member_ids(&conn, new_id).unwrap().is_empty());
-        assert!(insert_group(&conn, "acme", "2026-10-15").is_err());
+        assert!(insert_group(&conn, "acme", None, "2026-10-15").is_err());
         assert!(
             conn.pragma_query_value(None, "foreign_keys", |r| r.get::<_, bool>(0))
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn group_description_migrates_existing_groups_and_limits_length() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        for sql in &MIGRATIONS[..6] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch(
+            "PRAGMA user_version = 6;
+             INSERT INTO bbs_groups (id, name, created_at) VALUES (1, 'acme', '2026-10-14');
+             INSERT INTO bbs_groups (id, name, created_at, archived_at)
+                 VALUES (2, 'old', '2026-10-14', '2026-10-15');",
+        )
+        .unwrap();
+        migrate(&mut conn).unwrap();
+        migrate(&mut conn).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 7);
+        let row = |description: Option<&str>| GroupRow {
+            name: "acme".into(),
+            description: description.map(Into::into),
+            members: vec![],
+        };
+        assert_eq!(list_groups(&conn, None).unwrap(), vec![row(None)]);
+
+        set_group_description(&conn, 1, Some("Infra work")).unwrap();
+        assert_eq!(
+            list_groups(&conn, None).unwrap(),
+            vec![row(Some("Infra work"))]
+        );
+        // Character count, not bytes: 200 multi-byte characters fit.
+        let limit = "\u{e9}".repeat(200);
+        set_group_description(&conn, 1, Some(&limit)).unwrap();
+        assert!(set_group_description(&conn, 1, Some(&format!("{limit}x"))).is_err());
+        assert!(set_group_description(&conn, 1, Some("")).is_err());
+        assert!(insert_group(&conn, "big", Some(&"x".repeat(201)), "2026-10-15").is_err());
+        set_group_description(&conn, 1, None).unwrap();
+        assert_eq!(list_groups(&conn, None).unwrap(), vec![row(None)]);
+
+        // Archived groups keep their state; updates only reach active groups.
+        set_group_description(&conn, 2, Some("ignored")).unwrap();
+        let archived: Option<String> = conn
+            .query_row("SELECT description FROM bbs_groups WHERE id = 2", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(archived, None);
+        let id = insert_group(&conn, "new", Some("Fresh scope"), "2026-10-15").unwrap();
+        assert_eq!(
+            list_groups(&conn, None).unwrap()[1],
+            GroupRow {
+                name: "new".into(),
+                description: Some("Fresh scope".into()),
+                members: vec![],
+            }
+        );
+        assert_ne!(id, 1);
     }
 
     #[test]
@@ -964,7 +1063,7 @@ mod tests {
             agent("Bram", "t2"),
             agent("Cian", "t3"),
         );
-        let g = insert_group(&conn, "acme", t).unwrap();
+        let g = insert_group(&conn, "acme", None, t).unwrap();
 
         let m = insert_message(&conn, &a, Some(g), "hello all", t).unwrap();
         for p in [&b, &c, &will] {

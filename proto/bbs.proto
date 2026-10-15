@@ -26,8 +26,11 @@ service Bbs {
   // Retire another agent. Humans only.
   rpc Retire(RetireRequest) returns (ByeResponse);
 
-  rpc GroupRegister(GroupRequest) returns (GroupResponse);
+  // Humans only. A description requires group-description.v1.
+  rpc GroupRegister(GroupRegisterRequest) returns (GroupResponse);
   rpc GroupDelete(GroupRequest) returns (GroupResponse);
+  // Set or clear a group's description. Humans only; requires group-description.v1.
+  rpc GroupDescribe(GroupDescribeRequest) returns (GroupResponse);
   rpc GroupJoin(GroupRequest) returns (GroupJoinResponse);
   rpc GroupLeave(GroupRequest) returns (GroupResponse);
   rpc GroupRemove(GroupRemoveRequest) returns (GroupRemoveResponse);
@@ -96,12 +99,25 @@ message ByeResponse { string name = 1; }
 message RetireRequest { string agent = 1; }
 
 message GroupRequest { string group = 1; }   // with or without leading '@'
+// Field 1 matches GroupRequest, the request type before group-description.v1.
+message GroupRegisterRequest {
+  string group = 1;
+  optional string description = 2;  // one line, at most 200 characters
+}
+message GroupDescribeRequest {
+  string group = 1;
+  optional string description = 2;  // absent clears the description
+}
 message GroupResponse { string group = 1; }  // canonical name, no '@'
 message GroupJoinResponse { string group = 1; bool joined = 2; }  // joined=false: already a member
 message GroupRemoveRequest { string group = 1; string agent = 2; }
 message GroupRemoveResponse { string group = 1; string agent = 2; }  // canonical names
 message GroupListResponse { repeated Group groups = 1; }
-message Group { string name = 1; repeated string members = 2; }
+message Group {
+  string name = 1;
+  repeated string members = 2;
+  optional string description = 3;  // absent when unset or from older servers
+}
 
 message SendRequest { string to = 1; string body = 2; }
 message SendResponse {

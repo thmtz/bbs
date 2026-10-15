@@ -22,6 +22,7 @@ const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const FEED_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const WAIT_TOUCH_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const GROUP_DESCRIPTION: &str = "group-description.v1";
 
 pub enum Backend {
     Local(Local),
@@ -102,6 +103,19 @@ fn status_error(status: tonic::Status) -> anyhow::Error {
         status.message().to_string()
     };
     anyhow::Error::new(status).context(message)
+}
+
+/// A v2 server older than an RPC answers UNIMPLEMENTED before it checks the
+/// required capability; report the capability as the server itself would.
+fn missing_rpc(error: anyhow::Error, capability: &str) -> anyhow::Error {
+    match error.downcast_ref::<tonic::Status>() {
+        Some(status) if status.code() == tonic::Code::Unimplemented => {
+            anyhow::Error::new(status.clone()).context(format!(
+                "incompatible BBS server: required capability {capability} is unavailable; upgrade the server or use a compatible client"
+            ))
+        }
+        _ => error,
+    }
 }
 
 /// One unary RPC: `rpc!(remote, method, request)`.
@@ -223,11 +237,30 @@ impl Backend {
 
     pub async fn group_register(
         &mut self,
-        req: proto::GroupRequest,
+        req: proto::GroupRegisterRequest,
     ) -> Result<proto::GroupResponse> {
         match self {
             Backend::Local(l) => service::group_register(&mut l.conn, &l.caller, req),
-            Backend::Remote(r) => rpc!(r, group_register, req),
+            Backend::Remote(r) => {
+                // Older servers would silently drop an unknown description field.
+                let capabilities: &[&str] = if req.description.is_some() {
+                    &[GROUP_DESCRIPTION]
+                } else {
+                    &[]
+                };
+                rpc!(r, group_register, req, capabilities)
+            }
+        }
+    }
+
+    pub async fn group_describe(
+        &mut self,
+        req: proto::GroupDescribeRequest,
+    ) -> Result<proto::GroupResponse> {
+        match self {
+            Backend::Local(l) => service::group_describe(&mut l.conn, &l.caller, req),
+            Backend::Remote(r) => rpc!(r, group_describe, req, &[GROUP_DESCRIPTION])
+                .map_err(|e| missing_rpc(e, GROUP_DESCRIPTION)),
         }
     }
 
@@ -604,6 +637,27 @@ mod tests {
                 .await
                 .is_err()
         );
+        assert!(
+            backend
+                .group_register(proto::GroupRegisterRequest {
+                    group: "acme".into(),
+                    description: Some("Infra".into()),
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
+                .group_register(proto::GroupRegisterRequest::default())
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
+                .group_describe(proto::GroupDescribeRequest::default())
+                .await
+                .is_err()
+        );
         server.abort();
         let expected = [
             ("EnsureHuman", None),
@@ -615,6 +669,9 @@ mod tests {
             ("BindSession", Some("human-token-sessions.v1")),
             ("SessionAgent", Some("human-token-sessions.v1")),
             ("GroupDelete", Some("group-archive.v1")),
+            ("GroupRegister", Some("group-description.v1")),
+            ("GroupRegister", None),
+            ("GroupDescribe", Some("group-description.v1")),
         ];
         let observed = observations.lock().unwrap();
         assert_eq!(
@@ -635,6 +692,55 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct UnimplementedService;
+    impl tonic::server::NamedService for UnimplementedService {
+        const NAME: &'static str = "bbs.v2.Bbs";
+    }
+    impl Service<http::Request<Body>> for UnimplementedService {
+        type Response = http::Response<Body>;
+        type Error = Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(&mut self, _: &mut TaskContext<'_>) -> Poll<Result<(), Infallible>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, _: http::Request<Body>) -> Self::Future {
+            Box::pin(async { Ok(tonic::Status::unimplemented("").into_http()) })
+        }
+    }
+
+    /// A v2 server that predates GroupDescribe answers UNIMPLEMENTED; the client
+    /// must name the missing capability rather than blame the protocol epoch.
+    #[tokio::test]
+    async fn describe_against_older_server_names_the_missing_capability() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(UnimplementedService)
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let remote = Remote::connect(&address.to_string(), Caller::default())
+            .await
+            .unwrap();
+        let mut backend = Backend::Remote(remote);
+        let error = backend
+            .group_describe(proto::GroupDescribeRequest {
+                group: "acme".into(),
+                description: Some("Infra".into()),
+            })
+            .await
+            .unwrap_err();
+        server.abort();
+        assert_eq!(
+            error.to_string(),
+            "incompatible BBS server: required capability group-description.v1 is unavailable; upgrade the server or use a compatible client"
+        );
+        assert_eq!(
+            error.downcast_ref::<tonic::Status>().unwrap().code(),
+            tonic::Code::Unimplemented
+        );
+    }
     #[derive(Clone)]
     struct StalledInfo {
         send_headers: bool,

@@ -376,8 +376,12 @@ async fn serve_round_trip_and_wait_for_mail() {
     let group = proto::GroupRequest {
         group: "@acme".into(),
     };
+    let register = proto::GroupRegisterRequest {
+        group: "@acme".into(),
+        description: Some("Acme work".into()),
+    };
     client
-        .group_register(as_human("will", group.clone()))
+        .group_register(as_human("will", register))
         .await
         .unwrap();
 
@@ -392,6 +396,14 @@ async fn serve_round_trip_and_wait_for_mail() {
             .into_inner();
         assert_eq!((joined.group.as_str(), joined.joined), ("acme", true));
     }
+    let groups = client
+        .group_list(as_agent(&b.token, proto::Empty {}))
+        .await
+        .unwrap()
+        .into_inner()
+        .groups;
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].description.as_deref(), Some("Acme work"));
     let me = client
         .whoami(as_agent(&b.token, proto::Empty {}))
         .await

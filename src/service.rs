@@ -17,6 +17,8 @@ use crate::proto;
 
 const RETIRE_AFTER_DAYS: i64 = 7;
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
+/// Group descriptions are one line, counted in characters (also a schema CHECK).
+const MAX_GROUP_DESCRIPTION_CHARS: usize = 200;
 /// `active_at` is refreshed at most this often.
 const ACTIVE_AT_DEBOUNCE: chrono::Duration = chrono::Duration::seconds(60);
 
@@ -203,6 +205,27 @@ fn validate_group_name(name: &str) -> Result<()> {
         bail!("invalid group name {name:?}: use lowercase letters, digits, '_' or '-'");
     }
     Ok(())
+}
+
+/// A trimmed, single-line description within the length limit.
+fn validate_group_description(description: &str) -> Result<&str> {
+    let description = description.trim();
+    if description.is_empty() {
+        bail!("group description is empty");
+    }
+    if description
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+    {
+        bail!("group description must be one line without control characters");
+    }
+    let chars = description.chars().count();
+    if chars > MAX_GROUP_DESCRIPTION_CHARS {
+        bail!(
+            "group description is {chars} characters; the limit is {MAX_GROUP_DESCRIPTION_CHARS}"
+        );
+    }
+    Ok(description)
 }
 
 fn validate_body(body: &str) -> Result<()> {
@@ -410,17 +433,49 @@ fn require_group(conn: &Connection, group: &str) -> Result<i64> {
 pub fn group_register(
     conn: &mut Connection,
     caller: &Caller,
-    req: proto::GroupRequest,
+    req: proto::GroupRegisterRequest,
 ) -> Result<proto::GroupResponse> {
     with_ctx(conn, caller, |ctx| {
         let me = ctx.human()?;
         let group = group_name(&req.group);
         validate_group_name(group)?;
+        let description = req
+            .description
+            .as_deref()
+            .map(validate_group_description)
+            .transpose()?;
         if db::group_id(ctx.conn, group)?.is_some() {
             bail!("group @{group} already exists");
         }
-        db::insert_group(ctx.conn, group, &ctx.now_s)?;
+        db::insert_group(ctx.conn, group, description, &ctx.now_s)?;
         tracing::info!(group, by = me.name, "registered group");
+        Ok(proto::GroupResponse {
+            group: group.to_string(),
+        })
+    })
+}
+
+pub fn group_describe(
+    conn: &mut Connection,
+    caller: &Caller,
+    req: proto::GroupDescribeRequest,
+) -> Result<proto::GroupResponse> {
+    with_ctx(conn, caller, |ctx| {
+        let me = ctx.human()?;
+        let group = group_name(&req.group);
+        let description = req
+            .description
+            .as_deref()
+            .map(validate_group_description)
+            .transpose()?;
+        let gid = require_group(ctx.conn, group)?;
+        db::set_group_description(ctx.conn, gid, description)?;
+        tracing::info!(
+            group,
+            by = me.name,
+            cleared = description.is_none(),
+            "described group"
+        );
         Ok(proto::GroupResponse {
             group: group.to_string(),
         })
@@ -543,7 +598,11 @@ pub fn group_list(conn: &mut Connection, caller: &Caller) -> Result<proto::Group
         let only = (me.kind == db::Kind::Agent).then_some(me.id);
         let groups = db::list_groups(ctx.conn, only)?
             .into_iter()
-            .map(|(name, members)| proto::Group { name, members })
+            .map(|g| proto::Group {
+                name: g.name,
+                members: g.members,
+                description: g.description,
+            })
             .collect();
         Ok(proto::GroupListResponse { groups })
     })
