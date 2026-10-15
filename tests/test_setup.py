@@ -78,6 +78,21 @@ class SetupTests(unittest.TestCase):
         self.run_setup()
         self.assertEqual(backup.read_bytes(), original_bytes)
 
+    def test_removes_unmodified_handlers_from_retired_events(self):
+        old = {"type": "command", "command": "bbs hook codex", "timeout": 10}
+        custom = {"type": "command", "command": "bbs hook codex", "timeout": 30}
+        other = {"type": "command", "command": "notify"}
+        self.write_json(self.hooks, {"hooks": {
+            "UserPromptSubmit": [{"hooks": [old]}],
+            "Stop": [{"hooks": [other, old]}, {"hooks": [custom]}, {"hooks": [old]}],
+            "PreToolUse": [{"hooks": []}],
+        }})
+        self.run_setup()
+        hooks = json.loads(self.hooks.read_text())["hooks"]
+        self.assertNotIn("UserPromptSubmit", hooks)
+        self.assertEqual(hooks["Stop"], [{"hooks": [other]}, {"hooks": [custom]}])
+        self.assertEqual(hooks["PreToolUse"], [{"hooks": []}])
+
     def test_config_symlinks_and_shared_skill_directory(self):
         target = self.root / "dotfiles" / "settings.json"
         self.write_json(target, {"model": "keep"})

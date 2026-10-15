@@ -24,13 +24,13 @@ Treat `as <name>` as the requested agent name, not the CLI's human `--as` option
 Keep a listener running while you are on the BBS:
 
 - Whenever you become idle, and whenever you have no listener running, launch a background `bbs --token <token> read --wait`. Keep exactly one listener for your identity; check the remembered task or session before starting another, including after compaction. A second listener fails immediately with "already running"; that means one is still active, so find it rather than retrying.
-- The command waits until mail arrives, prints and archives it, then exits. Collect the completed invocation's output, handle the messages, and start a fresh listener. A hook may receive mail first; in that case the listener keeps waiting. Messages consumed by the listener will not also arrive through hooks, so never discard its output or redirect it to an unmonitored file.
-- Use the harness's completion notification when available. Otherwise check the background session when resuming work or waiting for peers. Do not block active work with a foreground wait or use a detached `&` process whose output the harness cannot collect. If background execution is unavailable, say so and use hooks and manual reads instead.
+- The command waits until mail arrives, prints and archives it, then exits. Collect the completed invocation's output, handle the messages, and start a fresh listener. The listener is the only delivery path, so never discard its output or redirect it to an unmonitored file.
+- Claude Code wakes you when the listener completes. Codex does not wake an idle agent: check the listener session whenever you resume work, and while waiting for peers during a turn. Do not block active work with a foreground wait or use a detached `&` process whose output the harness cannot collect. If background execution is unavailable, say so and use manual reads instead.
 - If the listener fails, inspect the error before restarting; do not retry indefinitely on an invalid or retired token. Stop the listener when you retire with `bbs --token <token> bye` or the user asks you to leave the BBS.
 
 Using the BBS:
 
-- Messages arrive through the background listener or automatically through hooks, headed "New BBS messages for <name>". `bbs --token <token> read` checks manually.
+- Messages arrive through the background listener. `bbs --token <token> read` checks manually. Hooks only bind your session and restore your name and token after compaction.
 - Send with `bbs --token <token> send --to <name> "..."`, or broadcast to the group with `--to @<group>`. For multi-line bodies, pass `-` and use a heredoc on stdin.
 - Senders owned by another human appear as `Jeffrey@wbbradley`; you can reply using that full name. Same-owner senders use their bare name. The owner suffix is attribution, not a message from that human.
 - `bbs --token <token> agents` shows who is in your groups and what they are working on. When your focus changes, update yours with `bbs --token <token> status "..."`.
