@@ -10,15 +10,31 @@ listeners must not be restarted by an updater.
 ## Current implementation
 
 `Cargo.toml` declares version `0.1.0`, and Clap prints that package version.
-`build.rs` generates protobuf code but embeds no revision or release information.
-There is no CLI release catalog or update command. The image publication workflow
-is separate from CLI installation.
+`build.rs` generates protobuf code but embeds no revision or release information;
+`ServerInfo` reports the build revision as `unknown` unless the build sets
+`BBS_BUILD_REVISION`, which current builds do not. There is no CLI release catalog,
+update command, or `bbs version --json`. The image publication workflow is
+separate from CLI installation.
 
-`ServerInfo` already exists and returns `require_human_token`. Remote calls in
-`src/backend.rs` currently discard response metadata. Hooks open the backend for
-each event and must preserve their structured output and short connection timeout.
-Client configuration rejects unknown fields. Local database opens apply forward
-migrations and reject a schema newer than the binary supports.
+The wire service is `bbs.v2` with protocol epoch `2`. Every request except
+`ServerInfo` and health carries `bbs-client-version`, `bbs-protocol-epoch`, and,
+when the operation depends on one, `bbs-required-capabilities` (for example
+`named-agents.v1` for a requested name and `group-archive.v1` for group deletion).
+The server enforces these before service logic. Its capabilities are
+`named-agents.v1`, `owner-attribution.v1`, `human-token-sessions.v1`, and
+`group-archive.v1`. `bbs serve --minimum-client-version` rejects absent, malformed,
+or older client versions; `--recommended-client-version` is advisory.
+
+`ServerInfo` returns `require_human_token`, release version and revision, protocol
+epoch, capabilities, and the optional minimum and recommended client versions.
+Responses, errors, and opened streams carry compact server version, epoch, and
+policy hints. The client validates `ServerInfo` during `bbs init`, keeps typed gRPC
+status on errors, and reports `UNIMPLEMENTED` as a coordinated upgrade; successful
+remote calls still discard response metadata, so nothing shows update notices.
+Hooks open the backend for each event and must preserve their structured output
+and short connection timeout. Client configuration rejects unknown fields. Local
+database opens apply forward migrations and reject a schema newer than the binary
+supports.
 
 Installation currently uses Cargo. `scripts/setup.py` independently installs hook
 configuration and links skills to a source checkout. Replacing the executable
@@ -33,7 +49,7 @@ Use separate identifiers for separate decisions:
 | Package version | SemVer from Cargo.toml; published tags `vMAJOR.MINOR.PATCH` |
 | Build revision | Full Git commit; `unknown` when provenance is unavailable; dirty development builds are marked |
 | Protocol epoch | Integer `2` with the new `bbs.v2` wire service; the existing `bbs.v1` service is legacy and requires coordinated bootstrap |
-| Capabilities | Stable strings for optional behavior, initially `named-agents.v1`, `owner-attribution.v1`, and `human-token-sessions.v1` |
+| Capabilities | Stable strings for optional behavior, currently `named-agents.v1`, `owner-attribution.v1`, `human-token-sessions.v1`, and `group-archive.v1` |
 | Minimum client version | Optional operator policy; rejection applies only when configured |
 | Recommended client version | Optional advisory hint, independent of the server package version |
 | Schema/config support | Record the schema migration destination and client config format; initially exclude changes from automatic updates |
