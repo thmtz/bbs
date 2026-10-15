@@ -695,9 +695,8 @@ fn config_path(bbs: &Bbs) -> PathBuf {
 fn init_writes_and_merges_config() {
     let bbs = Bbs::new("config");
     assert!(!config_path(&bbs).exists(), "plain init writes no config");
-    // Bind a session that has human mail waiting, so a Stop hook would block.
+    // Bind a session, so a compaction hook would re-inject its identity.
     let register_out = bbs.ok(&["register"]);
-    let name = register_out.split('"').nth(1).unwrap();
     hook(
         &bbs,
         serde_json::json!({
@@ -708,7 +707,6 @@ fn init_writes_and_merges_config() {
             "tool_response": { "stdout": register_out, "stderr": "" },
         }),
     );
-    bbs.ok(&["send", "--to", name, "hello"]);
 
     // Failed enrollment preserves the working local configuration.
     let down = "connecting to bbs server at 127.0.0.1:1";
@@ -726,10 +724,10 @@ fn init_writes_and_merges_config() {
 
     // Commands use the configured server; hooks stay silent when it is down.
     assert!(bbs.err(&["whoami"]).contains(down));
-    let stop = serde_json::json!({"session_id": "s1", "hook_event_name": "Stop"});
-    assert_eq!(hook(&bbs, stop.clone()), None);
+    let compact = serde_json::json!({"session_id": "s1", "hook_event_name": "SessionStart", "source": "compact"});
+    assert_eq!(hook(&bbs, compact.clone()), None);
     std::fs::remove_file(config_path(&bbs)).unwrap();
-    assert_eq!(hook(&bbs, stop).unwrap()["decision"], "block");
+    assert!(hook(&bbs, compact).is_some());
 }
 
 #[test]
@@ -775,7 +773,7 @@ fn remote_backend_round_trip() {
     assert!(bbs.ok(&["read"]).contains("standup"));
     assert_eq!(bbs.ok(&["whoami"]), "will\n");
 
-    // Hooks bind and deliver through the server.
+    // Hooks bind through the server but leave mail for the listener.
     let post_tool = serde_json::json!({
         "session_id": "s1",
         "hook_event_name": "PostToolUse",
@@ -785,12 +783,27 @@ fn remote_backend_round_trip() {
     });
     assert!(hook(&bbs, post_tool).is_none());
     bbs.ok(&["send", "--to", b, "from will"]);
-    let stop = serde_json::json!({"session_id": "s1", "hook_event_name": "Stop"});
-    let out = hook(&bbs, stop).unwrap();
+    let compact = serde_json::json!({"session_id": "s1", "hook_event_name": "SessionStart", "source": "compact"});
+    let out = hook(&bbs, compact).unwrap();
+    let tb = register_out.split("--token ").nth(1).unwrap();
+    let tb = tb.split(' ').next().unwrap();
     assert!(
-        out["reason"].as_str().unwrap().contains("from will"),
+        out["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains(tb),
         "{out}"
     );
+    for name in ["UserPromptSubmit", "Stop"] {
+        assert!(
+            hook(
+                &bbs,
+                serde_json::json!({"session_id": "s1", "hook_event_name": name})
+            )
+            .is_none()
+        );
+    }
+    assert!(bbs.ok(&["--token", tb, "read"]).contains("from will"));
 
     // `read --wait` blocks on the server until mail arrives.
     let mut waiter = bbs.spawn(&["--token", &ta, "read", "--wait"]);
@@ -1340,18 +1353,7 @@ fn hook(bbs: &Bbs, event: serde_json::Value) -> Option<serde_json::Value> {
 
 fn active_at_writes_are_debounced(mode: Mode) {
     let bbs = Bbs::with_mode("debounce", mode);
-    let register_out = bbs.ok(&["register"]);
     let (_, ta) = bbs.register();
-    let post_tool = |command: &str, stdout: &str| {
-        serde_json::json!({
-            "session_id": "s1",
-            "hook_event_name": "PostToolUse",
-            "tool_name": "Bash",
-            "tool_input": { "command": command },
-            "tool_response": { "stdout": stdout },
-        })
-    };
-    hook(&bbs, post_tool("bbs register", &register_out));
     bbs.ok(&["whoami"]);
     bbs.ok(&["--token", &ta, "whoami"]);
 
@@ -1364,7 +1366,6 @@ fn active_at_writes_are_debounced(mode: Mode) {
     let before = version();
     bbs.ok(&["whoami"]);
     bbs.ok(&["--token", &ta, "agents"]);
-    hook(&bbs, post_tool("ls", ""));
     assert_eq!(version(), before);
 
     // Stale timestamps are still refreshed.
@@ -1375,7 +1376,6 @@ fn active_at_writes_are_debounced(mode: Mode) {
     .unwrap();
     bbs.ok(&["whoami"]);
     bbs.ok(&["--token", &ta, "whoami"]);
-    hook(&bbs, post_tool("ls", ""));
     let stale: i64 = db
         .query_row(
             "SELECT (SELECT COUNT(*) FROM agents WHERE active_at < '2001')
@@ -1387,9 +1387,8 @@ fn active_at_writes_are_debounced(mode: Mode) {
     assert_eq!(stale, 0);
 }
 
-fn claude_code_hooks_bind_and_deliver(mode: Mode) {
+fn claude_code_hooks_bind_and_restore_identity(mode: Mode) {
     let bbs = Bbs::with_mode("hook", mode);
-    bbs.ok(&["group", "register", "acme"]);
     let register_out = bbs.ok(&["register"]);
     let (a, ta) = (
         register_out.split('"').nth(1).unwrap().to_string(),
@@ -1402,10 +1401,6 @@ fn claude_code_hooks_bind_and_deliver(mode: Mode) {
             .unwrap()
             .to_string(),
     );
-    bbs.ok(&["human", "add", "ada"]);
-    let (b, tb) = bbs.register_with(&["--as", "ada", "register", "--name", "Jeffrey"]);
-    bbs.ok(&["--token", &ta, "group", "join", "acme"]);
-    bbs.ok(&["--token", &tb, "group", "join", "acme"]);
     bbs.ok(&["send", "--to", &a, "before binding"]);
 
     let post_tool = |command: &str, stdout: &str| {
@@ -1418,48 +1413,35 @@ fn claude_code_hooks_bind_and_deliver(mode: Mode) {
         })
     };
     let event = |name: &str| serde_json::json!({ "session_id": "s1", "hook_event_name": name });
+    let compact = serde_json::json!({ "session_id": "s1", "hook_event_name": "SessionStart", "source": "compact" });
 
     // Unbound sessions are a silent no-op.
-    assert!(hook(&bbs, event("UserPromptSubmit")).is_none());
+    assert!(hook(&bbs, compact.clone()).is_none());
     assert!(hook(&bbs, serde_json::json!({"garbage": true})).is_none());
 
-    // Seeing `bbs register` output binds the session and delivers pending mail.
-    let out = hook(&bbs, post_tool("bbs register --note x", &register_out)).unwrap();
-    let ctx = out["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap();
-    assert_eq!(out["hookSpecificOutput"]["hookEventName"], "PostToolUse");
-    assert!(ctx.contains("before binding"), "{ctx}");
+    // Seeing `bbs register` output binds the session without taking mail.
+    assert!(hook(&bbs, post_tool("bbs register --note x", &register_out)).is_none());
+    bbs.ok(&["send", "--to", &a, "after binding"]);
     assert!(hook(&bbs, post_tool("ls", "")).is_none());
-
-    // Stop only blocks for human messages.
-    bbs.ok(&["--token", &tb, "send", "--to", &a, "agent chatter"]);
-    assert!(hook(&bbs, event("Stop")).is_none());
-    bbs.ok(&["send", "--to", &a, "human says stop"]);
-    let out = hook(&bbs, event("Stop")).unwrap();
-    assert_eq!(out["decision"], "block");
-    let reason = out["reason"].as_str().unwrap();
-    assert!(
-        reason.contains("human says stop") && !reason.contains("agent chatter"),
-        "{reason}"
-    );
-
-    // The agent message is still waiting for the next prompt.
-    let out = hook(&bbs, event("UserPromptSubmit")).unwrap();
-    assert!(
-        out["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .unwrap()
-            .contains(&format!("from {b}@ada to {a}:"))
-    );
+    for name in ["UserPromptSubmit", "Stop", "SessionStart"] {
+        assert!(hook(&bbs, event(name)).is_none(), "{name}");
+    }
 
     // After compaction the identity is re-injected.
-    let out = hook(&bbs, serde_json::json!({ "session_id": "s1", "hook_event_name": "SessionStart", "source": "compact" })).unwrap();
+    let out = hook(&bbs, compact).unwrap();
+    assert_eq!(out["hookSpecificOutput"]["hookEventName"], "SessionStart");
     assert!(
         out["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .unwrap()
             .contains(&ta)
+    );
+
+    // Mail is left for the listener.
+    let mail = bbs.ok(&["--token", &ta, "read"]);
+    assert!(
+        mail.contains("before binding") && mail.contains("after binding"),
+        "{mail}"
     );
 
     // Re-registering in the same session retires the old identity.
@@ -1502,15 +1484,20 @@ fn codex_hooks_bind_from_string_tool_response(mode: Mode) {
     ]);
 
     // Bindings are per harness: the same session id under claude-code is unbound.
-    let stop = serde_json::json!({ "session_id": "c1", "hook_event_name": "Stop", "stop_hook_active": false });
-    let out = bbs.run_with_stdin(&["hook", "claude-code"], &stop.to_string());
+    let compact = serde_json::json!({ "session_id": "c1", "hook_event_name": "SessionStart", "source": "compact" });
+    let out = bbs.run_with_stdin(&["hook", "claude-code"], &compact.to_string());
     assert!(out.stdout.is_empty());
 
-    let out = codex(stop).unwrap();
-    assert_eq!(out["decision"], "block");
-    assert!(out["reason"].as_str().unwrap().contains("hi codex"));
-    // Delivered via the hook, so nothing is left unread.
-    assert_eq!(bbs.ok(&["--token", token, "read"]), "");
+    let out = codex(compact).unwrap();
+    assert!(
+        out["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains(token)
+    );
+    let stop = serde_json::json!({ "session_id": "c1", "hook_event_name": "Stop", "stop_hook_active": false });
+    assert!(codex(stop).is_none());
+    assert!(bbs.ok(&["--token", token, "read"]).contains("hi codex"));
 }
 
 impl Bbs {
@@ -1701,7 +1688,7 @@ both_modes!(
     leaving_or_removal_notifies_the_group,
     agents_lists_status_and_scopes_visibility,
     active_at_writes_are_debounced,
-    claude_code_hooks_bind_and_deliver,
+    claude_code_hooks_bind_and_restore_identity,
     codex_hooks_bind_from_string_tool_response,
     read_wait_blocks_until_mail_arrives,
     only_one_read_wait_per_inbox,

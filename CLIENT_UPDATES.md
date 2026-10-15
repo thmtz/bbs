@@ -38,8 +38,9 @@ Responses, errors, and opened streams carry compact server version, epoch, and
 policy hints. The client validates `ServerInfo` during `bbs init`, keeps typed gRPC
 status on errors, and reports `UNIMPLEMENTED` as a coordinated upgrade; successful
 remote calls still discard response metadata, so nothing shows update notices.
-Hooks open the backend for each event and must preserve their structured output
-and short connection timeout. Client configuration rejects unknown fields. Local
+Hooks open the backend only to bind a registering session or restore identity
+after compaction, and must preserve their structured output and short
+connection timeout. Client configuration rejects unknown fields. Local
 database opens apply forward migrations and reject a schema newer than the binary
 supports.
 

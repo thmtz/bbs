@@ -56,6 +56,24 @@ def merge_hooks(config, template):
                     missing.append(copy.deepcopy(handler))
             if missing:
                 groups.append({**copy.deepcopy(wanted), "hooks": missing})
+    # Remove unmodified BBS handlers from events this version no longer uses.
+    ours = [
+        handler
+        for groups in template["hooks"].values()
+        for group in groups
+        for handler in group["hooks"]
+    ]
+    for event in [event for event in hooks if event not in template["hooks"]]:
+        groups = []
+        for group in hooks[event]:
+            kept = [handler for handler in group["hooks"] if handler not in ours]
+            # Drop a group only when it held nothing but BBS handlers.
+            if kept or not group["hooks"]:
+                groups.append({**group, "hooks": kept})
+        if groups:
+            hooks[event] = groups
+        else:
+            del hooks[event]
     return merged
 
 
