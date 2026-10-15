@@ -40,9 +40,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
     println!("cargo:rustc-env=BBS_BUILD_REVISION={revision}");
-    if let Some(dirty) = dirty {
-        println!("cargo:rustc-env=BBS_BUILD_DIRTY={dirty}");
-    }
+    // Always set, empty when unknown, so a builder's own BBS_BUILD_DIRTY can
+    // never reach the compiled-in value.
+    let dirty = dirty.map(|d| d.to_string()).unwrap_or_default();
+    println!("cargo:rustc-env=BBS_BUILD_DIRTY={dirty}");
     println!(
         "cargo:rustc-env=BBS_BUILD_TARGET={}",
         std::env::var("TARGET")?

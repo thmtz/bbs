@@ -8,11 +8,16 @@ use crate::{config, db, proto, protocol};
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const REVISION: &str = env!("BBS_BUILD_REVISION");
 pub const TARGET: &str = env!("BBS_BUILD_TARGET");
-const DIRTY: Option<&str> = option_env!("BBS_BUILD_DIRTY");
+/// `true`, `false`, or empty when unknown.
+const DIRTY: &str = env!("BBS_BUILD_DIRTY");
 
 /// Whether tracked build inputs differed from the revision; unknown with the revision.
 pub fn dirty() -> Option<bool> {
-    DIRTY.and_then(|v| v.parse().ok())
+    parse_dirty(DIRTY)
+}
+
+fn parse_dirty(value: &str) -> Option<bool> {
+    value.parse().ok()
 }
 
 /// Clean builds of a known revision are the only candidates for official
@@ -118,6 +123,17 @@ mod tests {
         assert_eq!(Provenance::of(rev, Some(true)), Provenance::Dirty);
         assert_eq!(Provenance::of(rev, None), Provenance::Unknown);
         assert_eq!(Provenance::of("unknown", Some(false)), Provenance::Unknown);
+    }
+
+    #[test]
+    fn embedded_dirty_flag_is_empty_when_unknown() {
+        assert_eq!(parse_dirty("true"), Some(true));
+        assert_eq!(parse_dirty("false"), Some(false));
+        assert_eq!(parse_dirty(""), None);
+        assert!(["true", "false", ""].contains(&DIRTY));
+        if REVISION == "unknown" {
+            assert_eq!(DIRTY, "");
+        }
     }
 
     #[test]
