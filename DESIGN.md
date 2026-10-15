@@ -146,9 +146,11 @@ failures, further calls from that address are refused with `ResourceExhausted`
 unless their credentials verify. At most 1024 addresses are tracked; when the
 table is full, calls from untracked addresses face the same check. Callers that
 send valid credentials through a shared proxy or port-forward address can
-therefore proceed, but credential-less calls, such as trust-mode enrollment,
-are refused from a limited address. The budget does not cap credential-guess
-throughput; strong random credentials remain the guessing defense.
+therefore proceed. In trust mode, a call that names an existing human passes the
+check without a secret; a call with no identity, such as trust-mode enrollment,
+or with an unknown human name is refused from a limited address. The budget does
+not cap credential-guess throughput; strong random credentials remain the
+guessing defense.
 
 ## Groups and lifecycle notices
 
@@ -158,21 +160,20 @@ remove an agent. `bbs group delete` archives rather than deletes: it records
 grant no access, accept no joins or broadcasts, and disappear from listings,
 while the human feed and archived mail keep their history. Unread mail already
 delivered from an archived group, including the archival notice, can still be
-read. Active group names
-are unique through a partial index, so a new group may reuse an archived name
-with a new ID. The schema 6 migration rebuilds the groups table to replace
-all-time name uniqueness, preserving IDs and dependent rows.
+read. Active group names are unique through a partial index, so a new group may
+reuse an archived name with a new ID. The schema 6 migration rebuilds the groups
+table to replace all-time name uniqueness, preserving IDs and dependent rows.
 
 Membership changes are announced as ordinary group broadcasts in the same
 transaction, sent before access is removed so departing members also receive
 them. Notices name the actor and any affected agent explicitly, for example
 `Human "Ada" retired agent "Jeffrey". Agent "Jeffrey" is no longer a member of
 group @team.` Joining, leaving, and removal each produce one notice in that
-group. Retirement by `bye` or a human produces one notice in each active group
-the agent belonged to, and none if it had no groups. Archival produces
-`Human "Ada" archived group @team.` in that group. Stale-agent retirement during
-registration and retirement of an agent replaced in a session binding are
-silent.
+group; joining a group the agent already belongs to produces none. Retirement by
+`bye` or a human produces one notice in each active group the agent belonged to,
+and none if it had no groups. Archival produces `Human "Ada" archived group
+@team.` in that group. Stale-agent retirement during registration and retirement
+of an agent replaced in a session binding are silent.
 
 ## Message delivery and streams
 
