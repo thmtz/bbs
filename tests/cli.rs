@@ -1014,6 +1014,135 @@ fn humans_remove_agents_from_groups(mode: Mode) {
     );
 }
 
+fn deleting_groups_archives_history_and_removes_access(mode: Mode) {
+    let bbs = Bbs::with_mode("archive-group", mode);
+    bbs.ok(&["group", "register", "acme"]);
+    bbs.ok(&["group", "register", "other"]);
+    let (a, ta) = bbs.register();
+    let (b, tb) = bbs.register();
+    for token in [&ta, &tb] {
+        bbs.ok(&["--token", token, "group", "join", "acme"]);
+        bbs.ok(&["--token", token, "read"]);
+    }
+    bbs.ok(&["--token", &ta, "group", "join", "other"]);
+    bbs.ok(&[
+        "--token",
+        &ta,
+        "send",
+        "--to",
+        "@acme",
+        "retained broadcast",
+    ]);
+    assert!(
+        bbs.err(&["--token", &ta, "group", "delete", "acme"])
+            .contains("humans only")
+    );
+    assert!(
+        bbs.err(&["group", "delete", "missing"])
+            .contains("no such group")
+    );
+    assert_eq!(
+        bbs.ok(&["group", "delete", "@acme"]),
+        "Archived group @acme.\n"
+    );
+    assert_eq!(bbs.ok(&["group", "list"]), format!("@other: {a}\n"));
+    assert_eq!(
+        bbs.ok(&["--token", &ta, "group", "list"]),
+        format!("@other: {a}\n")
+    );
+    assert_eq!(bbs.ok(&["--token", &tb, "group", "list"]), "");
+    assert!(!bbs.ok(&["agents"]).contains("acme"));
+    assert!(!bbs.ok(&["--token", &ta, "agents"]).contains(&b));
+    assert!(
+        bbs.err(&["--token", &ta, "send", "--to", &b, "denied"])
+            .contains("not in any of your groups")
+    );
+    for command in ["join", "leave"] {
+        assert!(
+            bbs.err(&["--token", &ta, "group", command, "acme"])
+                .contains("no such group")
+        );
+    }
+    assert!(
+        bbs.err(&["group", "remove", "acme", &a])
+            .contains("no such group")
+    );
+    assert!(
+        bbs.err(&["send", "--to", "@acme", "denied"])
+            .contains("no such group")
+    );
+    assert!(
+        bbs.err(&["--token", &ta, "send", "--to", "@acme", "denied"])
+            .contains("no such group")
+    );
+    assert!(
+        bbs.err(&["group", "delete", "acme"])
+            .contains("no such group")
+    );
+
+    assert!(
+        bbs.err(&["group", "register", "acme"])
+            .contains("archived names remain reserved")
+    );
+
+    // Archived membership rows cannot authorize access, but history remains readable.
+    let db = bbs.db();
+    let (archived, members): (bool, i64) = db.query_row(
+        "SELECT archived_at IS NOT NULL, (SELECT COUNT(*) FROM group_members WHERE group_id = g.id)
+         FROM bbs_groups g WHERE name = 'acme'", [], |r| Ok((r.get(0)?, r.get(1)?))
+    ).unwrap();
+    assert!(archived);
+    assert_eq!(members, 2);
+    let notice = "Human \"will\" archived group @acme.";
+    let unread = bbs.ok(&["--token", &tb, "read"]);
+    assert!(unread.contains("to @acme:\nretained broadcast"), "{unread}");
+    assert_eq!(unread.matches(notice).count(), 1, "{unread}");
+    let history = bbs.ok(&["--token", &tb, "read", "--archived"]);
+    assert!(history.contains("to @acme:\nretained broadcast"));
+    assert!(history.contains(notice));
+    assert!(bbs.ok(&["--token", &ta, "read"]).contains(notice));
+
+    // Sharing another active group still grants access independently.
+    bbs.ok(&["--token", &tb, "group", "join", "other"]);
+    bbs.ok(&["--token", &ta, "send", "--to", &b, "allowed"]);
+    assert!(bbs.ok(&["--token", &tb, "read"]).contains("allowed"));
+    bbs.ok(&["read"]);
+    bbs.ok(&["--token", &ta, "bye"]);
+    let retirement = bbs.ok(&["read"]);
+    assert!(retirement.contains("@other"));
+    assert!(!retirement.contains("@acme"), "{retirement}");
+}
+
+fn group_archive_rolls_back_notice_on_failure(mode: Mode) {
+    let bbs = Bbs::with_mode("archive-group-rollback", mode);
+    bbs.ok(&["group", "register", "acme"]);
+    let (a, ta) = bbs.register();
+    bbs.ok(&["--token", &ta, "group", "join", "acme"]);
+    bbs.ok(&["read"]);
+    let db = bbs.db();
+    db.execute_batch(
+        "CREATE TRIGGER reject_archive BEFORE UPDATE OF archived_at ON bbs_groups
+         BEGIN SELECT RAISE(ABORT, 'archive blocked'); END;",
+    )
+    .unwrap();
+    assert!(
+        bbs.err(&["group", "delete", "acme"])
+            .contains("archive blocked")
+    );
+    assert_eq!(bbs.ok(&["group", "list"]), format!("@acme: {a}\n"));
+    assert_eq!(bbs.ok(&["--token", &ta, "read"]), "");
+    assert_eq!(bbs.ok(&["read"]), "");
+    db.execute_batch("DROP TRIGGER reject_archive").unwrap();
+    bbs.ok(&["group", "delete", "acme"]);
+    assert!(
+        bbs.ok(&["--token", &ta, "read"])
+            .contains("archived group @acme")
+    );
+    bbs.ok(&["group", "register", "empty"]);
+    bbs.ok(&["group", "delete", "empty"]);
+    assert_eq!(bbs.ok(&["group", "list"]), "");
+}
+
 fn joining_notifies_the_group(mode: Mode) {
     let bbs = Bbs::with_mode("join", mode);
     bbs.ok(&["group", "register", "g"]);
@@ -1458,6 +1587,8 @@ both_modes!(
     human_name_is_reserved_and_permissions_enforced,
     whoami_reports_agent_or_human,
     humans_remove_agents_from_groups,
+    deleting_groups_archives_history_and_removes_access,
+    group_archive_rolls_back_notice_on_failure,
     joining_notifies_the_group,
     leaving_or_removal_notifies_the_group,
     agents_lists_status_and_scopes_visibility,

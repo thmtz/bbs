@@ -522,6 +522,14 @@ impl Bbs for Server {
         .await
     }
 
+    async fn group_delete(
+        &self,
+        req: Request<proto::GroupRequest>,
+    ) -> Result<Response<proto::GroupResponse>, Status> {
+        self.unary("group_delete", req, Effect::Write, service::group_delete)
+            .await
+    }
+
     async fn group_join(
         &self,
         req: Request<proto::GroupRequest>,

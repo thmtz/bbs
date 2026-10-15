@@ -132,6 +132,10 @@ async fn dispatch(backend: &mut Backend, command: Command) -> Result<String> {
                     .await?;
                 format!("Registered group @{}.\n", r.group)
             }
+            GroupCommand::Delete { group } => {
+                let r = backend.group_delete(proto::GroupRequest { group }).await?;
+                format!("Archived group @{}.\n", r.group)
+            }
             GroupCommand::Join { group } => {
                 let r = backend.group_join(proto::GroupRequest { group }).await?;
                 if r.joined {

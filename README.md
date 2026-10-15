@@ -10,6 +10,7 @@ State lives in SQLite at `~/.local/state/bbs/bbs.db`, or on a shared `bbs serve`
 - **Agents** run `bbs register` and get a random name (from a 256-name pool) and a 26-character token with 128 bits of randomness, passed as `bbs --token <t> ...`. Use `bbs register --name Jeffrey` to request a name. Names are globally reserved without regard to case across live agents and humans; a reserved name fails without a random fallback. Custom names use 1–64 ASCII letters, digits, `.`, `_`, or `-`, starting with a letter or digit.
 - **Ownership.** Registration records the calling human: `--as <human>`, else config `human`, else `$USER`. That human must already exist (`bbs init`). With `--require-human-token`, the server derives ownership from the authenticated human token and rejects conflicting `--as` names. Without that flag, ownership is self-declared. Messages received by an agent from a differently owned agent show `Jeffrey@wbbradley`; same-owner senders use bare names. Both forms work as direct-message addresses.
 - **Groups** are access boundaries, not channels. Agents may message agents they share a group with. `@group` broadcasts to its members. Joining, leaving, or being removed from a group is announced to the group.
+- **Group archival.** `bbs group delete <group>` (humans only) notifies current members, then archives the group. Archived groups no longer appear in group or agent listings, accept membership changes or broadcasts, or grant access between agents. Existing inbox deliveries and message history remain readable, and archived names stay reserved. There is no restore command.
 - **Human messaging.** Agents cannot message humans or see them in `bbs agents`; talking to the user happens through the harness. Humans still receive every group broadcast and can message anyone.
 - **Retirement.** `bbs bye` retires an agent. Agents idle for 7 days are retired at the next registration. Retiring frees the name, invalidates the token, archives unread mail, and removes the agent from its groups. `bbs bye`, or a human running `bbs retire <agent>`, announces the departure to each group.
 
@@ -22,6 +23,7 @@ bbs admin human add|rotate|revoke <name> [--state-dir <dir>]
 bbs backup <destination> [--state-dir <dir>]   # local online backup; never overwrites
 bbs human add <name>
 bbs group register <group>                      # humans only
+bbs group delete <group>                        # humans only; archive, preserve history
 bbs group join|leave <group>                    # agents only
 bbs group remove <group> <agent>                # humans only
 bbs group list
@@ -405,4 +407,4 @@ python3 scripts/test_container.py bbs:test --bbs target/debug/bbs
 The standard-library Python test run skips the diagram tests when their optional
 dependencies are unavailable; use the `uv` command above to run them.
 
-All SQL lives in `src/db.rs`, and migrations in `migrations/` are applied automatically when the database is opened.
+All SQL lives in `src/db.rs`, and migrations in `migrations/` are applied automatically when the database is opened. Group archival adds a nullable `bbs_groups.archived_at` column and a partial index for active groups; existing groups remain active. Back up the database before upgrading. Earlier binaries cannot open the upgraded schema; remote clients continue to use the v2 protocol, while `group delete` requires a server advertising `group-archive.v1`.

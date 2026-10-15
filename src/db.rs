@@ -14,6 +14,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0003_agents_active_index.sql"),
     include_str!("../migrations/0004_agent_owners.sql"),
     include_str!("../migrations/0005_human_tokens.sql"),
+    include_str!("../migrations/0006_group_archive.sql"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -457,11 +458,19 @@ pub fn list_agents(conn: &Connection, include_retired: bool) -> Result<Vec<Agent
 pub fn group_id(conn: &Connection, name: &str) -> Result<Option<i64>> {
     Ok(conn
         .query_row(
-            "SELECT id FROM bbs_groups WHERE name = ?1",
+            "SELECT id FROM bbs_groups WHERE name = ?1 AND archived_at IS NULL",
             params![name],
             |r| r.get(0),
         )
         .optional()?)
+}
+
+pub fn group_name_reserved(conn: &Connection, name: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bbs_groups WHERE name = ?1)",
+        params![name],
+        |r| r.get(0),
+    )?)
 }
 
 pub fn insert_group(conn: &Connection, name: &str, now: &str) -> Result<i64> {
@@ -470,6 +479,14 @@ pub fn insert_group(conn: &Connection, name: &str, now: &str) -> Result<i64> {
         params![name, now],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+pub fn archive_group(conn: &Connection, group_id: i64, now: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE bbs_groups SET archived_at = ?1 WHERE id = ?2 AND archived_at IS NULL",
+        params![now, group_id],
+    )?;
+    Ok(())
 }
 
 /// Returns false if the agent was already a member.
@@ -493,7 +510,8 @@ pub fn leave_group(conn: &Connection, group_id: i64, agent_id: i64) -> Result<bo
 
 pub fn is_member(conn: &Connection, group_id: i64, agent_id: i64) -> Result<bool> {
     let n: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM group_members WHERE group_id = ?1 AND agent_id = ?2",
+        "SELECT COUNT(*) FROM group_members m JOIN bbs_groups g ON g.id = m.group_id
+         WHERE m.group_id = ?1 AND m.agent_id = ?2 AND g.archived_at IS NULL",
         params![group_id, agent_id],
         |r| r.get(0),
     )?;
@@ -504,7 +522,8 @@ pub fn share_group(conn: &Connection, a: i64, b: i64) -> Result<bool> {
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM group_members x
          JOIN group_members y ON x.group_id = y.group_id
-         WHERE x.agent_id = ?1 AND y.agent_id = ?2",
+         JOIN bbs_groups g ON g.id = x.group_id
+         WHERE x.agent_id = ?1 AND y.agent_id = ?2 AND g.archived_at IS NULL",
         params![a, b],
         |r| r.get(0),
     )?;
@@ -514,7 +533,9 @@ pub fn share_group(conn: &Connection, a: i64, b: i64) -> Result<bool> {
 pub fn group_member_ids(conn: &Connection, group_id: i64) -> Result<Vec<i64>> {
     let mut stmt = conn.prepare(
         "SELECT m.agent_id FROM group_members m JOIN agents a ON a.id = m.agent_id
-         WHERE m.group_id = ?1 AND a.retired_at IS NULL ORDER BY m.agent_id",
+         JOIN bbs_groups g ON g.id = m.group_id
+         WHERE m.group_id = ?1 AND a.retired_at IS NULL AND g.archived_at IS NULL
+         ORDER BY m.agent_id",
     )?;
     let ids = stmt
         .query_map(params![group_id], |r| r.get(0))?
@@ -526,7 +547,7 @@ pub fn group_member_ids(conn: &Connection, group_id: i64) -> Result<Vec<i64>> {
 pub fn member_groups(conn: &Connection, agent_id: i64) -> Result<Vec<(i64, String)>> {
     let mut stmt = conn.prepare(
         "SELECT g.id, g.name FROM group_members m JOIN bbs_groups g ON g.id = m.group_id
-         WHERE m.agent_id = ?1 ORDER BY g.name",
+         WHERE m.agent_id = ?1 AND g.archived_at IS NULL ORDER BY g.name",
     )?;
     let groups = stmt
         .query_map(params![agent_id], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -540,7 +561,8 @@ pub fn list_groups(conn: &Connection, agent_id: Option<i64>) -> Result<Vec<(Stri
         "SELECT g.name, a.name FROM bbs_groups g
          LEFT JOIN group_members m ON m.group_id = g.id
          LEFT JOIN agents a ON a.id = m.agent_id
-         WHERE ?1 IS NULL OR g.id IN (SELECT group_id FROM group_members WHERE agent_id = ?1)
+         WHERE g.archived_at IS NULL
+         AND (?1 IS NULL OR g.id IN (SELECT group_id FROM group_members WHERE agent_id = ?1))
          ORDER BY g.name, lower(a.name)",
     )?;
     let mut groups: Vec<(String, Vec<String>)> = Vec::new();
@@ -563,7 +585,8 @@ pub fn list_groups(conn: &Connection, agent_id: Option<i64>) -> Result<Vec<(Stri
 pub fn agent_groups(conn: &Connection) -> Result<HashMap<i64, Vec<String>>> {
     let mut stmt = conn.prepare(
         "SELECT m.agent_id, g.name FROM group_members m
-         JOIN bbs_groups g ON g.id = m.group_id ORDER BY g.name",
+         JOIN bbs_groups g ON g.id = m.group_id
+         WHERE g.archived_at IS NULL ORDER BY g.name",
     )?;
     let mut map: HashMap<i64, Vec<String>> = HashMap::new();
     let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
@@ -787,6 +810,74 @@ pub fn data_version(conn: &Connection) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_archive_migrates_existing_board_and_preserves_history() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        for sql in &MIGRATIONS[..5] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch(
+            "PRAGMA user_version = 5;
+             INSERT INTO humans VALUES (1, 'will', '2026-10-14', '2026-10-14');
+             INSERT INTO agents (id, name, token, pwd, hostname, created_at, active_at)
+                 VALUES (1, 'Aiko', 'token', '/', 'host', '2026-10-14', '2026-10-14');
+             INSERT INTO bbs_groups VALUES (1, 'acme', '2026-10-14');
+             INSERT INTO group_members VALUES (1, 1, '2026-10-14');
+             INSERT INTO messages VALUES (1, 'human', 1, 1, 'old message', '2026-10-14');
+             INSERT INTO deliveries VALUES (1, 'agent', 1, NULL);",
+        )
+        .unwrap();
+        migrate(&mut conn).unwrap();
+        migrate(&mut conn).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 6);
+        assert_eq!(group_id(&conn, "acme").unwrap(), Some(1));
+        assert_eq!(
+            list_groups(&conn, None).unwrap(),
+            vec![("acme".into(), vec!["Aiko".into()])]
+        );
+        assert!(is_member(&conn, 1, 1).unwrap());
+        assert_eq!(group_member_ids(&conn, 1).unwrap(), vec![1]);
+        assert_eq!(member_groups(&conn, 1).unwrap(), vec![(1, "acme".into())]);
+        archive_group(&conn, 1, "2026-10-15").unwrap();
+        assert_eq!(group_id(&conn, "acme").unwrap(), None);
+        assert!(group_name_reserved(&conn, "acme").unwrap());
+        assert!(!is_member(&conn, 1, 1).unwrap());
+        assert!(!share_group(&conn, 1, 1).unwrap());
+        assert!(group_member_ids(&conn, 1).unwrap().is_empty());
+        assert!(member_groups(&conn, 1).unwrap().is_empty());
+        assert!(agent_groups(&conn).unwrap().is_empty());
+        assert!(list_groups(&conn, None).unwrap().is_empty());
+        assert!(list_groups(&conn, Some(1)).unwrap().is_empty());
+        let feed = recent_messages(&conn, 10).unwrap();
+        assert_eq!(feed.len(), 1);
+        assert_eq!(feed[0].to_group.as_deref(), Some("acme"));
+        assert_eq!(feed[0].body, "old message");
+        let reader = Principal {
+            kind: Kind::Agent,
+            id: 1,
+            name: "Aiko".into(),
+        };
+        let unread = take_unread(&conn, &reader, None, None, "2026-10-15").unwrap();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].to_group.as_deref(), Some("acme"));
+        assert!(
+            !conn
+                .prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .exists([])
+                .unwrap()
+        );
+        let index_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name = 'bbs_groups_active_name'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(index_sql.contains("WHERE archived_at IS NULL"));
+    }
 
     #[test]
     fn feed_shows_broadcasts_once_and_dm_read_times() {

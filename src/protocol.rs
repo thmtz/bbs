@@ -12,6 +12,7 @@ pub const CAPABILITIES: &[&str] = &[
     "named-agents.v1",
     "owner-attribution.v1",
     "human-token-sessions.v1",
+    "group-archive.v1",
 ];
 const MAX_METADATA_BYTES: usize = 1024;
 const MAX_VERSION_BYTES: usize = 128;

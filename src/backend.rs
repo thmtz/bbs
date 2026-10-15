@@ -231,6 +231,13 @@ impl Backend {
         }
     }
 
+    pub async fn group_delete(&mut self, req: proto::GroupRequest) -> Result<proto::GroupResponse> {
+        match self {
+            Backend::Local(l) => service::group_delete(&mut l.conn, &l.caller, req),
+            Backend::Remote(r) => rpc!(r, group_delete, req, &["group-archive.v1"]),
+        }
+    }
+
     pub async fn group_join(
         &mut self,
         req: proto::GroupRequest,
@@ -591,6 +598,12 @@ mod tests {
                 .await
                 .is_err()
         );
+        assert!(
+            backend
+                .group_delete(proto::GroupRequest::default())
+                .await
+                .is_err()
+        );
         server.abort();
         let expected = [
             ("EnsureHuman", None),
@@ -601,6 +614,7 @@ mod tests {
             ("WatchFeed", Some("owner-attribution.v1")),
             ("BindSession", Some("human-token-sessions.v1")),
             ("SessionAgent", Some("human-token-sessions.v1")),
+            ("GroupDelete", Some("group-archive.v1")),
         ];
         let observed = observations.lock().unwrap();
         assert_eq!(
