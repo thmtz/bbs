@@ -12,10 +12,33 @@ use tonic_health::pb::{
 };
 
 mod proto {
-    tonic::include_proto!("bbs.v1");
+    tonic::include_proto!("bbs.v2");
 }
 
 use proto::bbs_client::BbsClient;
+
+type Client = BbsClient<
+    tonic::service::interceptor::InterceptedService<
+        Channel,
+        fn(Request<()>) -> Result<Request<()>, tonic::Status>,
+    >,
+>;
+
+fn with_contract(mut req: Request<()>) -> Result<Request<()>, tonic::Status> {
+    req.metadata_mut()
+        .insert("bbs-protocol-epoch", "2".parse().unwrap());
+    req.metadata_mut().insert(
+        "bbs-client-version",
+        env!("CARGO_PKG_VERSION").parse().unwrap(),
+    );
+    req.metadata_mut().insert(
+        "bbs-required-capabilities",
+        "named-agents.v1,owner-attribution.v1,human-token-sessions.v1"
+            .parse()
+            .unwrap(),
+    );
+    Ok(req)
+}
 
 struct Server {
     child: Child,
@@ -29,11 +52,17 @@ impl Server {
     }
 
     fn start_mode(test: &str, protected: bool) -> Server {
+        Self::start_options(test, protected, &[])
+    }
+
+    fn start_options(test: &str, protected: bool, args: &[&str]) -> Server {
         let home = std::env::temp_dir().join(format!("bbs-serve-{}-{test}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_bbs"));
-        command.args(["serve", "--listen", "127.0.0.1:0"]);
+        command
+            .args(["serve", "--listen", "127.0.0.1:0"])
+            .args(args);
         if protected {
             command.arg("--require-human-token");
         }
@@ -55,10 +84,19 @@ impl Server {
         Server { child, home, addr }
     }
 
-    async fn client(&self) -> BbsClient<Channel> {
+    async fn raw_client(&self) -> BbsClient<Channel> {
         BbsClient::connect(format!("http://{}", self.addr))
             .await
             .unwrap()
+    }
+
+    async fn client(&self) -> Client {
+        let channel = Channel::from_shared(format!("http://{}", self.addr))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        BbsClient::with_interceptor(channel, with_contract as fn(_) -> _)
     }
 }
 
@@ -84,12 +122,223 @@ fn as_human<T>(name: &str, msg: T) -> Request<T> {
     req
 }
 
-async fn register(client: &mut BbsClient<Channel>) -> proto::RegisterResponse {
+fn contract<T>(msg: T) -> Request<T> {
+    let mut req = Request::new(msg);
+    req.metadata_mut()
+        .insert("bbs-protocol-epoch", "2".parse().unwrap());
+    req.metadata_mut().insert(
+        "bbs-client-version",
+        env!("CARGO_PKG_VERSION").parse().unwrap(),
+    );
+    req
+}
+
+#[tokio::test]
+async fn incompatible_requests_do_not_touch_state_or_claim_stream_slots() {
+    let server = Server::start("protocol-effects");
+    let mut client = server.client().await;
+    let agent = register(&mut client).await;
+    client
+        .send(as_human(
+            "will",
+            proto::SendRequest {
+                to: agent.name.clone(),
+                body: "unread".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    let db = rusqlite::Connection::open(server.home.join(".local/state/bbs/bbs.db")).unwrap();
+    db.execute(
+        "UPDATE humans SET active_at = '2001-01-01T00:00:00.000000Z'",
+        [],
+    )
+    .unwrap();
+    let before: String = db
+        .query_row(
+            "SELECT active_at FROM humans WHERE name = 'will'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut raw = server.raw_client().await;
+    let err = raw
+        .ensure_human(proto::EnsureHumanRequest {
+            name: "intruder".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(err.metadata().get("bbs-protocol-epoch").unwrap(), "2");
+    let mut request = contract(proto::RegisterRequest {
+        name: Some("MustNotExist".into()),
+        ..Default::default()
+    });
+    request
+        .metadata_mut()
+        .insert("bbs-human", "will".parse().unwrap());
+    request.metadata_mut().insert(
+        "bbs-required-capabilities",
+        "named-agents.v1,unknown.v1".parse().unwrap(),
+    );
+    assert!(
+        raw.register(request)
+            .await
+            .unwrap_err()
+            .message()
+            .contains("unknown.v1")
+    );
+    assert!(
+        raw.watch_feed(as_human("will", proto::FeedRequest { backlog: 10 }))
+            .await
+            .is_err()
+    );
+    assert!(
+        raw.wait_for_mail(as_agent(&agent.token, proto::WaitRequest { limit: None }))
+            .await
+            .is_err()
+    );
+    assert!(
+        raw.read(as_agent(&agent.token, proto::ReadRequest::default()))
+            .await
+            .is_err()
+    );
+    assert!(
+        raw.bind_session(proto::BindSessionRequest {
+            harness: "test".into(),
+            session_id: "rejected".into(),
+            token: agent.token.clone()
+        })
+        .await
+        .is_err()
+    );
+    let after: String = db
+        .query_row(
+            "SELECT active_at FROM humans WHERE name = 'will'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(before, after);
+    for query in [
+        "SELECT COUNT(*) FROM humans WHERE name = 'intruder'",
+        "SELECT COUNT(*) FROM agents WHERE name = 'MustNotExist'",
+        "SELECT COUNT(*) FROM sessions WHERE session_id = 'rejected'",
+    ] {
+        assert_eq!(db.query_row(query, [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    }
+    let response = client
+        .wait_for_mail(as_agent(&agent.token, proto::WaitRequest { limit: None }))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.metadata().get("bbs-server-version").unwrap(),
+        env!("CARGO_PKG_VERSION")
+    );
+    let mut stream = response.into_inner();
+    assert_eq!(stream.message().await.unwrap().unwrap().body, "unread");
+    assert!(stream.message().await.unwrap().is_none());
+    // The server sends hints as soon as an idle stream opens, without waiting for mail.
+    let idle = client
+        .wait_for_mail(as_agent(&agent.token, proto::WaitRequest { limit: None }))
+        .await
+        .unwrap();
+    assert_eq!(idle.metadata().get("bbs-protocol-epoch").unwrap(), "2");
+}
+
+#[tokio::test]
+async fn minimum_policy_preserves_public_diagnostics_and_error_hints() {
+    let server = Server::start_options(
+        "protocol-minimum",
+        false,
+        &[
+            "--minimum-client-version",
+            "9999.0.0",
+            "--recommended-client-version",
+            "9999.1.0",
+        ],
+    );
+    let mut raw = server.raw_client().await;
+    let info = raw.server_info(proto::Empty {}).await.unwrap().into_inner();
+    assert_eq!(info.protocol_epoch, Some(2));
+    assert_eq!(info.release.unwrap().version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(info.minimum_client_version.as_deref(), Some("9999.0.0"));
+    assert_eq!(info.recommended_client_version.as_deref(), Some("9999.1.0"));
+    let mut client = server.client().await;
+    let rejected = client
+        .ensure_human(proto::EnsureHumanRequest { name: "old".into() })
+        .await
+        .unwrap_err();
+    assert!(rejected.message().contains("upgrade the client"));
+    assert_eq!(
+        rejected
+            .metadata()
+            .get("bbs-minimum-client-version")
+            .unwrap(),
+        "9999.0.0"
+    );
+    let mut req = contract(proto::EnsureHumanRequest { name: "new".into() });
+    req.metadata_mut()
+        .insert("bbs-client-version", "9999.0.0".parse().unwrap());
+    raw.ensure_human(req).await.unwrap();
+    let mut health = HealthClient::new(
+        Channel::from_shared(format!("http://{}", server.addr))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        health
+            .check(HealthCheckRequest {
+                service: "bbs.v2.Bbs".into()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .status(),
+        ServingStatus::Serving
+    );
+}
+
+#[tokio::test]
+async fn legacy_service_is_unimplemented_without_mutation() {
+    let server = Server::start("legacy-protocol");
+    let channel = Channel::from_shared(format!("http://{}", server.addr))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut grpc = tonic::client::Grpc::new(channel);
+    grpc.ready().await.unwrap();
+    let response: Result<tonic::Response<proto::RegisterResponse>, _> = grpc
+        .unary(
+            as_human(
+                "will",
+                proto::RegisterRequest {
+                    name: Some("Legacy".into()),
+                    ..Default::default()
+                },
+            ),
+            tonic::codegen::http::uri::PathAndQuery::from_static("/bbs.v1.Bbs/Register"),
+            tonic_prost::ProstCodec::default(),
+        )
+        .await;
+    assert_eq!(response.unwrap_err().code(), tonic::Code::Unimplemented);
+    let db = rusqlite::Connection::open(server.home.join(".local/state/bbs/bbs.db")).unwrap();
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM agents", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+async fn register(client: &mut Client) -> proto::RegisterResponse {
     register_as(client, "will", None).await
 }
 
 async fn register_as(
-    client: &mut BbsClient<Channel>,
+    client: &mut Client,
     human: &str,
     name: Option<&str>,
 ) -> proto::RegisterResponse {
@@ -326,7 +575,7 @@ async fn health_reports_initialized_services_without_a_human() {
             .await
             .unwrap(),
     );
-    for service in ["", "bbs.v1.Bbs"] {
+    for service in ["", "bbs.v2.Bbs"] {
         let result = health
             .check(HealthCheckRequest {
                 service: service.into(),
@@ -426,7 +675,7 @@ async fn health_watchers_cannot_prevent_shutdown() {
     );
     let mut watch = health
         .watch(HealthCheckRequest {
-            service: "bbs.v1.Bbs".into(),
+            service: "bbs.v2.Bbs".into(),
         })
         .await
         .unwrap()
@@ -473,7 +722,7 @@ impl Server {
 }
 
 async fn protected_register(
-    client: &mut BbsClient<Channel>,
+    client: &mut Client,
     token: &str,
     name: &str,
 ) -> proto::RegisterResponse {
@@ -767,7 +1016,7 @@ async fn authentication_failure_budget_preserves_valid_callers_and_health() {
     assert_eq!(
         health
             .check(HealthCheckRequest {
-                service: "bbs.v1.Bbs".into()
+                service: "bbs.v2.Bbs".into()
             })
             .await
             .unwrap()

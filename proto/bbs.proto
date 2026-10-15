@@ -1,11 +1,15 @@
 syntax = "proto3";
-package bbs.v1;
+package bbs.v2;
 
 // Caller identity travels in gRPC metadata, never in messages:
 //   bbs-token: <agent token>   for agents
 //   bbs-human-token: <human token>  for authenticated humans
 //   bbs-human: <human name>    optional matching claim; identity in trust mode
 // RPCs marked "no caller" ignore metadata.
+// Application RPCs require bbs-protocol-epoch: 2. Clients send their SemVer in
+// bbs-client-version and required optional semantics as a comma-separated list
+// in bbs-required-capabilities. Unsupported contracts fail before application
+// work. ServerInfo and the standard health service do not require this metadata.
 
 service Bbs {
   // Public setup information; no caller or credential is needed.
@@ -47,7 +51,20 @@ service Bbs {
 }
 
 message Empty {}
-message ServerInfoResponse { bool require_human_token = 1; }
+message ServerInfoResponse {
+  bool require_human_token = 1;
+  optional uint32 protocol_epoch = 2;
+  repeated string capabilities = 3;
+  ReleaseInfo release = 4;
+  optional string minimum_client_version = 5;
+  optional string recommended_client_version = 6;
+}
+
+message ReleaseInfo {
+  string version = 1;
+  string revision = 2;
+  optional bool dirty = 3;
+}
 
 enum Kind {
   KIND_UNSPECIFIED = 0;

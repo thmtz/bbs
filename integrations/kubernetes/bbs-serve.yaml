@@ -69,12 +69,12 @@ spec:
           readinessProbe:
             grpc:
               port: 7777
-              service: bbs.v1.Bbs
+              service: bbs.v2.Bbs
             periodSeconds: 5
           livenessProbe:
             grpc:
               port: 7777
-              service: bbs.v1.Bbs
+              service: bbs.v2.Bbs
             periodSeconds: 30
           resources:
             requests:

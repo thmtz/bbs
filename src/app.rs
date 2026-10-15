@@ -63,11 +63,17 @@ pub async fn run(cli: Cli) -> Result<()> {
             listen,
             state_dir,
             require_human_token,
+            minimum_client_version,
+            recommended_client_version,
         } => {
             return crate::serve::run(
                 *listen,
                 state_dir.as_deref().unwrap_or(&dir),
                 *require_human_token,
+                crate::protocol::Policy::new(
+                    minimum_client_version.clone(),
+                    recommended_client_version.clone(),
+                )?,
             )
             .await;
         }

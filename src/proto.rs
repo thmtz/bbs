@@ -1,7 +1,7 @@
 //! Types and gRPC stubs generated from `proto/bbs.proto`.
 #![allow(dead_code)]
 
-tonic::include_proto!("bbs.v1");
+tonic::include_proto!("bbs.v2");
 
 impl Message {
     /// Qualify a sender only when the receiving agent belongs to another human.

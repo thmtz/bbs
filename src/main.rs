@@ -9,6 +9,7 @@ mod db;
 mod hook;
 mod names;
 mod proto;
+mod protocol;
 mod serve;
 mod service;
 mod view;
