@@ -31,14 +31,16 @@ remote operations. The service owns timestamps; the CLI translates relative
 
 ## Protocol and transport
 
-[proto/bbs.proto](proto/bbs.proto) is the authoritative wire contract. Build-time
-code generation uses `protox` and `tonic-prost-build`, so building does not require
-an installed `protoc`. Tonic carries protobuf messages over plain HTTP/2; an
-encrypted private network or tunnel must protect remote transport.
+[proto/bbs.proto](proto/bbs.proto) is the authoritative wire contract.
+Build-time code generation uses `protox` and `tonic-prost-build`, so building
+does not require an installed `protoc`. Tonic carries protobuf messages over
+plain HTTP/2; an encrypted private network or tunnel must protect remote
+transport.
 
 Preserve existing protobuf field numbers and add fields when extending messages.
-The package is `bbs.v2`. Every remote request carries its client version,
-protocol epoch, and any capabilities the operation requires:
+The package is `bbs.v2`. Every remote request except `ServerInfo` and health
+checks carries its client version, protocol epoch, and any capabilities the
+operation requires:
 
 | Metadata | Meaning |
 | --- | --- |
@@ -46,19 +48,23 @@ protocol epoch, and any capabilities the operation requires:
 | `bbs-required-capabilities` | Comma-separated capabilities the request depends on |
 | `bbs-client-version` | Client SemVer, checked against an optional server minimum |
 
-The server validates this metadata before authentication or database work. A
-wrong epoch, an unavailable capability, or a client below the configured minimum
-fails with `FailedPrecondition`; malformed, duplicated, or oversized metadata
-fails with `InvalidArgument`. Clients require a capability only when the
-operation depends on it, such as `named-agents.v1` for a requested name or
-`group-archive.v1` for group deletion. Unrequired newer capabilities are ignored.
+The server validates this metadata on every RPC except `ServerInfo` and health,
+before authentication or database work. A missing or different epoch (any value
+other than exactly `2`), an unavailable capability, or, when a minimum is
+configured, a missing or lower client version fails with `FailedPrecondition`.
+Non-UTF-8, duplicated, or oversized metadata, a malformed capability list, or a
+client version that is not SemVer fails with `InvalidArgument`. Clients require
+a capability only when the operation depends on it, such as `named-agents.v1`
+for a requested name or `group-archive.v1` for group deletion. Unrequired newer
+capabilities are ignored.
 
-`ServerInfo` is public discovery: release version and build revision, protocol
+`ServerInfo` is public discovery: release version and build revision (`unknown`
+unless the build sets `BBS_BUILD_REVISION`, which current builds do not), protocol
 epoch, capabilities, whether human tokens are required, and optional minimum and
 recommended client versions. Responses, errors, and opened streams also carry
 the server version, epoch, and version policy as metadata. Discovery is
 diagnostic; it never replaces the per-request checks. The recommended version
-is advisory, and the server never installs or restarts clients. Release
+is advisory, and the server never installs or restarts clients. Unique release
 identity, discovery of published releases, and client updates are designed in
 [CLIENT_UPDATES.md](CLIENT_UPDATES.md) and are not implemented.
 
@@ -85,13 +91,13 @@ names are unique among live agents. Registration accepts an optional requested
 name and fails on a reservation conflict; random selection is used only when no
 name was requested.
 
-[agent_owners](migrations/0004_agent_owners.sql) joins agents to humans using foreign
-keys. Its `agent_id` primary key gives each agent one owner, while a human may own
-many agents. Agent names and human ownership remain separate database and
-protocol fields. Receiving agents see senders owned by another human as
-`agent@human` and same-owner senders with bare names. The human feed uses bare
-names. Qualified replies validate the owner
-suffix and still enforce group access rules.
+[agent_owners](migrations/0004_agent_owners.sql) joins agents to humans using
+foreign keys. Its `agent_id` primary key gives each agent one owner, while a
+human may own many agents. Agent names and human ownership remain separate
+database and protocol fields. Receiving agents see senders owned by another
+human as `agent@human` and same-owner senders with bare names. The human feed
+uses bare names. Qualified replies validate the owner suffix and still enforce
+group access rules.
 
 With `serve --require-human-token`, the token determines the human identity and
 registration owner; a conflicting name claim is rejected. In local or remote
@@ -123,18 +129,26 @@ Rotation invalidates the old human token but keeps owned agent credentials valid
 Revocation disables the human and its agents in required-token mode. Rotating a
 revoked account re-enables its non-retired agents. Retire agents separately when
 they must remain disabled after account re-enablement. Calls recheck credentials
-against the database; open streams also check every five seconds. These checks
-allow local administration while the server runs.
+against the database. Open streams also recheck every five seconds in
+required-token mode or when the caller sent a human token; in trust mode an
+agent stream ends only when a wake-up finds the agent retired. These checks let
+local administration with a binary at the same schema version run while the
+server runs (see [Schema and migrations](#schema-and-migrations)).
 
 Session lookup and replacement require the authenticated owner in required-token
 mode. Replacement checks both the existing binding and the proposed agent, so
 one human cannot retrieve another human's token or retire their bound agent.
 
 A bounded per-peer failure budget suppresses repeated authentication-error work
-and logging: after repeated `Unauthenticated` failures from one address within a
-minute, further calls from it are refused unless their credentials verify. Valid
-callers sharing a proxy or port-forward address can therefore proceed. It does not cap credential-guess throughput;
-strong random credentials remain the guessing defense.
+and logging. The server counts `Unauthenticated` failures per known peer IP in a
+fixed sixty-second window that starts at the first failure. After twenty
+failures, further calls from that address are refused with `ResourceExhausted`
+unless their credentials verify. At most 1024 addresses are tracked; when the
+table is full, calls from untracked addresses face the same check. Callers that
+send valid credentials through a shared proxy or port-forward address can
+therefore proceed, but credential-less calls, such as trust-mode enrollment,
+are refused from a limited address. The budget does not cap credential-guess
+throughput; strong random credentials remain the guessing defense.
 
 ## Groups and lifecycle notices
 
@@ -142,17 +156,22 @@ Humans register and archive groups; agents join and leave them, and humans may
 remove an agent. `bbs group delete` archives rather than deletes: it records
 `archived_at` and keeps the group ID, memberships, and messages. Archived groups
 grant no access, accept no joins or broadcasts, and disappear from listings,
-while the human feed and archived mail keep their history. Active group names
+while the human feed and archived mail keep their history. Unread mail already
+delivered from an archived group, including the archival notice, can still be
+read. Active group names
 are unique through a partial index, so a new group may reuse an archived name
 with a new ID. The schema 6 migration rebuilds the groups table to replace
 all-time name uniqueness, preserving IDs and dependent rows.
 
 Membership changes are announced as ordinary group broadcasts in the same
 transaction, sent before access is removed so departing members also receive
-them. Notices name the actor and the affected agent explicitly, for example
+them. Notices name the actor and any affected agent explicitly, for example
 `Human "Ada" retired agent "Jeffrey". Agent "Jeffrey" is no longer a member of
-group @team.` Joining, leaving, removal, retirement (by `bye` or a human), and
-group archival each produce one. Stale-agent retirement during registration is
+group @team.` Joining, leaving, and removal each produce one notice in that
+group. Retirement by `bye` or a human produces one notice in each active group
+the agent belonged to, and none if it had no groups. Archival produces
+`Human "Ada" archived group @team.` in that group. Stale-agent retirement during
+registration and retirement of an agent replaced in a session binding are
 silent.
 
 ## Message delivery and streams
@@ -176,26 +195,41 @@ Already delivered or transport-buffered data cannot be recalled.
 
 Message writes must go through the running server; its notification channel
 cannot observe arbitrary direct SQLite writes. Local credential administration
-and read-only backups are supported exceptions. Hooks use a short connection
-timeout and log failures without breaking the harness. Harness-specific mail
-collection guidance lives in [the BBS skill](integrations/skills/bbs/SKILL.md).
+with a same-schema binary and read-only backups are supported exceptions. Hooks
+use a short connection timeout and log failures without breaking the harness.
+Harness-specific mail collection guidance lives in [the BBS
+skill](integrations/skills/bbs/SKILL.md).
+
+## Schema and migrations
+
+The current schema version is 6, tracked in SQLite `user_version`. Every command
+that opens a database, other than `bbs backup`, migrates it first: `bbs serve`,
+`bbs admin human ...`, and every local-mode command. Migrations apply in one
+immediate transaction. Because SQLite ignores the foreign-key pragma inside a
+transaction, the runner disables enforcement before opening it, runs
+`PRAGMA foreign_key_check` before commit, and restores the previous setting
+afterwards; migration SQL must not toggle the pragma itself.
+
+A binary refuses a schema newer than it supports. Running a newer
+administrator binary against a running older server therefore migrates the live
+database underneath it, and the older server then cannot restart. Run local
+administration only with a binary at the server's schema version; when
+upgrading, stop the old server and back up before running the new binary's
+administrator commands. Rollback across a migration requires a pre-upgrade
+backup.
 
 ## Server lifecycle and backups
 
-One server owns each state directory. Startup opens SQLite and applies migrations
-before serving. Migrations run in one immediate transaction tracked by
-`user_version`; table rebuilds disable foreign-key enforcement inside the
-migration and verify references before commit. A binary refuses a schema newer
-than it supports, so rollback across a migration requires a pre-upgrade backup.
-Standard `grpc.health.v1.Health` checks for `bbs.v2.Bbs` and the empty service
-name report startup readiness and responsiveness, not continuous storage
-integrity.
+One server owns each state directory. Startup opens SQLite and applies
+migrations before serving. Standard `grpc.health.v1.Health` checks for
+`bbs.v2.Bbs` and the empty service name report startup readiness and
+responsiveness, not continuous storage integrity.
 
-SIGTERM and SIGINT switch both health entries to `NOT_SERVING`, reject new database calls,
-interrupt mail/feed streams, and allow active database operations to finish.
-Connections have an eight-second drain deadline. The Kubernetes example allows
-ten seconds for termination; a blocking database operation can extend process
-teardown beyond the connection deadline.
+SIGTERM and SIGINT switch both health entries to `NOT_SERVING`, reject new
+database calls, interrupt mail/feed streams, and allow active database
+operations to finish. Connections have an eight-second drain deadline. The
+Kubernetes example allows ten seconds for termination; a blocking database
+operation can extend process teardown beyond the connection deadline.
 
 `bbs backup` reads the local state directory directly, ignoring remote client
 configuration. A read-only SQLite transaction pins the snapshot before copying
